@@ -21,6 +21,24 @@ import { replaceWithProjectDirMissing } from "./helpers/projectDirMissing.js";
 import { folderGone, isProjectRootMissing } from "./helpers/safePath.js";
 
 /**
+ * Whether a state-changing request's Origin names the host the request was
+ * sent to. No Origin header means a non-browser caller (curl, tests,
+ * in-process), which is allowed. An unparseable Origin (including the
+ * literal "null" a sandboxed page sends) names no host this server serves,
+ * so it never matches.
+ */
+function writeOriginAllowed(origin: string | undefined, host: string | undefined): boolean {
+  if (origin === undefined) return true;
+  let originHost: string | null = null;
+  try {
+    originHost = new URL(origin).host;
+  } catch {
+    originHost = null;
+  }
+  return !!originHost && !!host && originHost.toLowerCase() === host.toLowerCase();
+}
+
+/**
  * Create a Hono sub-app with all studio API routes.
  *
  * Both the vite dev server and CLI embedded server mount this app
@@ -28,6 +46,30 @@ import { folderGone, isProjectRootMissing } from "./helpers/safePath.js";
  */
 export function createStudioApi(adapter: StudioApiAdapter): Hono {
   const api = new Hono();
+  // The studio API is unauthenticated and its only legitimate caller is the
+  // Studio page this same server serves. A state-changing request that
+  // carries an Origin naming a different host than the request's Host did
+  // not come from that page: it is a cross-origin request from some other
+  // website open in the user's browser. CORS does not stop such requests
+  // from being SENT: POST with a text/plain or form body is "simple" and
+  // needs no preflight. It only stops the page reading the response, which
+  // a fire-and-forget file write or render trigger does not need. Reject
+  // those writes outright. Requests with no Origin header (curl, tests,
+  // in-process callers) are not browser traffic and keep working, as do
+  // reads: the guard covers state changes only.
+  api.use(async function rejectCrossOriginWrites(c, next) {
+    if (c.req.method === "GET" || c.req.method === "HEAD" || c.req.method === "OPTIONS") {
+      return next();
+    }
+    // Fetch Metadata: a cross-site request is refused even when the Origin
+    // header was stripped (some same-site-but-cross-origin setups send
+    // Sec-Fetch-Site: same-site, which stays allowed).
+    const crossSite = c.req.header("sec-fetch-site") === "cross-site";
+    if (crossSite || !writeOriginAllowed(c.req.header("origin"), c.req.header("host"))) {
+      return c.json({ error: "forbidden" }, 403);
+    }
+    return next();
+  });
   api.use(async function answerProjectDirMissingAfterErrorHandlers(c, next) {
     const hostHeaders = new Headers(c.res.headers);
     await next();
