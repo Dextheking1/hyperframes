@@ -61,15 +61,11 @@ function beingTaken(file: string): boolean {
   }
 }
 
-/** A holder is dead only when its pid is gone and its lock is not a claimant's empty file mid-write. */
 function deadHolder(file: string, pid: number): boolean {
   return !alive(pid) && !beingTaken(file);
 }
 
-/**
- * Takes `file` if nobody holds it: written aside and linked in, so a reader never sees it without its pid. A drive
- * without hard links (exFAT, some network drives) creates it exclusively instead; readers wait out the empty gap.
- */
+/** Takes `file` if nobody holds it, linked in whole so a reader never sees it without its pid; created in place where links fail. */
 function claim(file: string): boolean {
   const draft = `${file}-${process.pid}-${randomUUID()}.tmp`;
   writeFileSync(draft, String(process.pid));
