@@ -9,9 +9,7 @@ const PROXY_EXTENSIONS: ReadonlySet<string> = new Set(
   Object.values(PROXY_VARIANT_CONFIG).map(({ extension }) => extension),
 );
 const TRANSCODER_PROXY_NAME = /^[0-9a-f]{64}\.\w+$/;
-// A temp copy, or a temp piece of a long copy (`.part-<key>-<n>`).
 const TRANSCODER_TEMP_NAME = /^\.tmp-[0-9a-f-]{36}-(?:\.part-[0-9a-f]{64}-\d+|[0-9a-f]{64})\.\w+$/;
-// A finished piece waits here for a stopped copy to continue; it outlives the short temp limit.
 const TRANSCODER_PIECE_NAME = /^\.part-([0-9a-f]{64})-\d+(\.\w+)$/;
 const STALE_PIECE_MS = 60 * 60 * 1000;
 
@@ -71,7 +69,6 @@ function isLeftoverName(name: string): boolean {
   return TRANSCODER_TEMP_NAME.test(name) || TRANSCODER_PIECE_NAME.test(name);
 }
 
-/** Temp files die after `staleTempMs`; a finished piece after an hour, and never while its copy runs. */
 function leftoverIsDead(
   cacheDir: string,
   name: string,

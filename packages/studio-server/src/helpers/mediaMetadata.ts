@@ -76,7 +76,6 @@ export interface MediaMetadata {
   hasAudio?: boolean;
   /** Video stream carries alpha (pix_fmt or the VP8/VP9 alpha_mode tag). */
   hasAlpha?: boolean;
-  /** Container duration in seconds, when ffprobe reports one. */
   durationSeconds?: number;
   probeError?: string;
 }
