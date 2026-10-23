@@ -9,9 +9,11 @@ const PROXY_EXTENSIONS: ReadonlySet<string> = new Set(
   Object.values(PROXY_VARIANT_CONFIG).map(({ extension }) => extension),
 );
 const TRANSCODER_PROXY_NAME = /^[0-9a-f]{64}\.\w+$/;
-// A temp copy, or a temp piece of a long copy (`.part-<key>-<n>`); a finished piece waits for a restart under its `.part-` name.
+// A temp copy, or a temp piece of a long copy (`.part-<key>-<n>`).
 const TRANSCODER_TEMP_NAME = /^\.tmp-[0-9a-f-]{36}-(?:\.part-[0-9a-f]{64}-\d+|[0-9a-f]{64})\.\w+$/;
-const TRANSCODER_PIECE_NAME = /^\.part-[0-9a-f]{64}-\d+\.\w+$/;
+// A finished piece waits here for a stopped copy to continue; it outlives the short temp limit.
+const TRANSCODER_PIECE_NAME = /^\.part-([0-9a-f]{64})-\d+(\.\w+)$/;
+const STALE_PIECE_MS = 60 * 60 * 1000;
 
 export interface ProxyCacheCleanupOptions {
   maxBytes?: number;
@@ -65,6 +67,25 @@ function shouldSkipSweep(cacheDir: string, now: number, minSweepIntervalMs: numb
   return false;
 }
 
+function isLeftoverName(name: string): boolean {
+  return TRANSCODER_TEMP_NAME.test(name) || TRANSCODER_PIECE_NAME.test(name);
+}
+
+/** A temp file is dead once untouched for `staleTempMs`; a finished piece once untouched for an hour and its copy is not running. */
+function leftoverIsDead(
+  cacheDir: string,
+  name: string,
+  modifiedAt: number,
+  protectedPaths: ReadonlySet<string>,
+  now: number,
+  staleTempMs: number,
+): boolean {
+  const piece = TRANSCODER_PIECE_NAME.exec(name);
+  if (!piece) return now - modifiedAt >= staleTempMs;
+  const copyIsRunning = protectedPaths.has(join(cacheDir, `${piece[1]}${piece[2]}`));
+  return !copyIsRunning && now - modifiedAt >= STALE_PIECE_MS;
+}
+
 function readCacheInventory(
   cacheDir: string,
   protectedPaths: ReadonlySet<string>,
@@ -83,8 +104,10 @@ function readCacheInventory(
       modifiedAt: stat.mtimeMs,
       protected: protectedPaths.has(path),
     };
-    if (TRANSCODER_TEMP_NAME.test(dirent.name) || TRANSCODER_PIECE_NAME.test(dirent.name)) {
-      if (now - stat.mtimeMs >= staleTempMs) staleTemps.push(entry);
+    if (isLeftoverName(dirent.name)) {
+      if (leftoverIsDead(cacheDir, dirent.name, stat.mtimeMs, protectedPaths, now, staleTempMs)) {
+        staleTemps.push(entry);
+      }
     } else if (
       TRANSCODER_PROXY_NAME.test(dirent.name) &&
       PROXY_EXTENSIONS.has(extname(dirent.name))
