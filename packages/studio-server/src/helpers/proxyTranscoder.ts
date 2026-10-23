@@ -458,12 +458,7 @@ function ffmpegBudgetError(chunksKept: number, chunkCount: number): ProxyTransco
 
 type EncodeFn = (outputPath: string, timeoutMs: number, range?: ChunkRange) => Promise<void>;
 
-/**
- * Copies a long source in pieces. Each finished piece stays under a stable
- * name in the cache directory, so a copy that is killed or runs out of time
- * continues with the first missing piece instead of starting over. The pieces
- * start on keyframes of their own, so joining them without re-encoding is seamless.
- */
+/** Copies a long source in pieces that stay in the cache, so a stopped copy continues from the first missing one. */
 async function encodeInChunks(
   ranges: ChunkRange[],
   chunkPrefix: string,

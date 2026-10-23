@@ -71,7 +71,7 @@ function isLeftoverName(name: string): boolean {
   return TRANSCODER_TEMP_NAME.test(name) || TRANSCODER_PIECE_NAME.test(name);
 }
 
-/** A temp file is dead once untouched for `staleTempMs`; a finished piece once untouched for an hour and its copy is not running. */
+/** Temp files die after `staleTempMs`; a finished piece after an hour, and never while its copy runs. */
 function leftoverIsDead(
   cacheDir: string,
   name: string,
