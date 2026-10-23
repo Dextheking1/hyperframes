@@ -9,7 +9,9 @@ const PROXY_EXTENSIONS: ReadonlySet<string> = new Set(
   Object.values(PROXY_VARIANT_CONFIG).map(({ extension }) => extension),
 );
 const TRANSCODER_PROXY_NAME = /^[0-9a-f]{64}\.\w+$/;
-const TRANSCODER_TEMP_NAME = /^\.tmp-[0-9a-f-]{36}-[0-9a-f]{64}\.\w+$/;
+// A temp copy, or a temp piece of a long copy (`.part-<key>-<n>`); a finished piece waits for a restart under its `.part-` name.
+const TRANSCODER_TEMP_NAME = /^\.tmp-[0-9a-f-]{36}-(?:\.part-[0-9a-f]{64}-\d+|[0-9a-f]{64})\.\w+$/;
+const TRANSCODER_PIECE_NAME = /^\.part-[0-9a-f]{64}-\d+\.\w+$/;
 
 export interface ProxyCacheCleanupOptions {
   maxBytes?: number;
@@ -81,7 +83,7 @@ function readCacheInventory(
       modifiedAt: stat.mtimeMs,
       protected: protectedPaths.has(path),
     };
-    if (TRANSCODER_TEMP_NAME.test(dirent.name)) {
+    if (TRANSCODER_TEMP_NAME.test(dirent.name) || TRANSCODER_PIECE_NAME.test(dirent.name)) {
       if (now - stat.mtimeMs >= staleTempMs) staleTemps.push(entry);
     } else if (
       TRANSCODER_PROXY_NAME.test(dirent.name) &&

@@ -1183,6 +1183,7 @@ describe("preResolveHostileMediaProxies", () => {
         }),
       ],
       failedPaths: new Set(["/clip.mp4"]),
+      files: [{ file: "clip.mp4", state: "failed", reason: "ffmpeg exited with code 1" }],
     });
     expect(errorSpy).toHaveBeenCalledWith(
       expect.stringContaining("media proxy pre-resolve: 0/1 ready, 1 failed"),
@@ -1254,7 +1255,11 @@ describe("preResolveHostileMediaProxies", () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
 
     writeFileSync(join(projectDir, "a.mov.proxy.mp4"), "");
-    await preResolveHostileMediaProxies(projectDir, "<html></html>");
+    const { files } = await preResolveHostileMediaProxies(projectDir, "<html></html>");
+    expect(files).toEqual([
+      { file: "a.mov", state: "cached" },
+      { file: "b.mov", state: "ready" },
+    ]);
     expect(errorSpy.mock.calls.map(([line]) => String(line).slice(0, 48))).toEqual([
       "[hyperframes] Making browser-playable copies of ",
       "[hyperframes] browser-playable copies: 1/2",
@@ -1280,6 +1285,7 @@ describe("preResolveHostileMediaProxies", () => {
     await expect(preResolveHostileMediaProxies(projectDir, "<html></html>")).resolves.toEqual({
       findings: [],
       failedPaths: new Set(),
+      files: [],
     });
 
     expect(errorSpy).toHaveBeenCalledWith(

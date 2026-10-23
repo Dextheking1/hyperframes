@@ -115,6 +115,27 @@ describe("cleanupProxyCache", () => {
     expect(existsSync(inFlight)).toBe(true);
   });
 
+  it("sweeps stale pieces of a stopped long copy and keeps fresh ones", () => {
+    const cache = cacheDir();
+    const now = 1_800_000_000_000;
+    const key = basename(proxy(cache, "long"), ".mp4");
+    const stalePiece = join(cache, `.part-${key}-0.mp4`);
+    const stalePieceTemp = join(cache, `.tmp-${randomUUID()}-.part-${key}-1.mp4`);
+    const freshPiece = join(cache, `.part-${key}-2.mp4`);
+    writeEntry(stalePiece, 3, now - 2 * 60 * 60 * 1000);
+    writeEntry(stalePieceTemp, 3, now - 2 * 60 * 60 * 1000);
+    writeEntry(freshPiece, 3, now - 60 * 1000);
+
+    const result = cleanupProxyCache(cache, {
+      now,
+      staleTempMs: 60 * 60 * 1000,
+      minSweepIntervalMs: 0,
+    });
+
+    expect(result.removed.sort()).toEqual([stalePiece, stalePieceTemp].sort());
+    expect(existsSync(freshPiece)).toBe(true);
+  });
+
   it("never removes a file the transcoder did not name, even from an idle cache over budget", () => {
     const cache = cacheDir();
     const now = 1_800_000_000_000;

@@ -144,6 +144,7 @@ async function loadModule(
   isHdr = false,
   hdrTransfer: string | null = isHdr ? "pq" : null,
   codecName?: string,
+  durationSeconds?: number,
 ): Promise<typeof import("./proxyTranscoder.js")> {
   vi.resetModules();
   vi.doMock("node:child_process", () => {
@@ -157,11 +158,74 @@ async function loadModule(
     probeMediaMetadata: async () => ({
       kind: "video",
       color: { isHdr, hdrTransfer, codecName },
+      durationSeconds,
     }),
     probeFirstFrameColour: async () => ({}),
   }));
   return import("./proxyTranscoder.js");
 }
+
+describe("resolveProxy on a long source", () => {
+  const startsOf = (calls: SpawnCall[]): string[] =>
+    calls
+      .filter((call) => call.args.includes("-ss"))
+      .map((call) => call.args[call.args.indexOf("-ss") + 1]!);
+
+  it("copies in pieces, and a stopped copy continues from its finished pieces", async () => {
+    const { spawn, calls } = createSpawnSpy();
+    const { resolveProxy, getProxyCachePath, clearFailedTranscodesForTest } = await loadModule(
+      spawn,
+      FFMPEG_PATH,
+      false,
+      null,
+      undefined,
+      200,
+    );
+    const projectDir = tmpProject();
+    const sourcePath = join(projectDir, "long.mov");
+    writeFileSync(sourcePath, "source-bytes");
+    const cachePath = getProxyCachePath(projectDir, sourcePath);
+    const cacheDirectory = join(projectDir, ".transcode-cache");
+
+    const first = resolveProxy(projectDir, sourcePath).catch((error: unknown) => error);
+    await flush();
+    succeed(calls[0]!);
+    await flush(50);
+    calls[1]!.proc.emit("close", null, "SIGKILL");
+    expect(await first).toBeInstanceOf(Error);
+    expect(startsOf(calls)).toEqual(["0", "60"]);
+    expect(readdirSync(cacheDirectory)).toHaveLength(1);
+
+    clearFailedTranscodesForTest();
+    const second = resolveProxy(projectDir, sourcePath);
+    for (let answered = calls.length; ; answered = calls.length) {
+      await flush(50);
+      if (calls.length === answered) break;
+      calls.slice(answered).forEach((call) => succeed(call));
+    }
+
+    expect(await second).toBe(cachePath);
+    // Only the pieces that were missing were encoded again; the last one runs to the end.
+    expect(startsOf(calls)).toEqual(["0", "60", "60", "120"]);
+    expect(calls.at(-1)!.args).toEqual(expect.arrayContaining(["-f", "concat", "-c", "copy"]));
+    expect(readdirSync(cacheDirectory)).toEqual([cachePath.split("/").at(-1)]);
+  });
+
+  it("keeps a short source to one pass", async () => {
+    const { spawn, calls } = createSpawnSpy();
+    const { resolveProxy } = await loadModule(spawn, FFMPEG_PATH, false, null, undefined, 80);
+    const projectDir = tmpProject();
+    const sourcePath = join(projectDir, "short.mov");
+    writeFileSync(sourcePath, "source-bytes");
+
+    const result = resolveProxy(projectDir, sourcePath);
+    await flush();
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.args).not.toContain("-ss");
+    succeed(calls[0]!);
+    await result;
+  });
+});
 
 describe("resolveProxy", () => {
   it("bounds a caller wait without cancelling the shared transcode promise", async () => {

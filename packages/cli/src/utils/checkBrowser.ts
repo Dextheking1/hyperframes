@@ -147,7 +147,7 @@ export async function preResolveHostileMediaProxies(
   html: string,
   autoProxyOverride?: boolean,
 ): Promise<ProxyPreResolution> {
-  const none: ProxyPreResolution = { findings: [], failedPaths: new Set() };
+  const none: ProxyPreResolution = { findings: [], failedPaths: new Set(), files: [] };
   if (!resolveAutoProxy(projectDir, autoProxyOverride)) return none;
   let codecMap: Awaited<ReturnType<typeof scanProjectMediaCodecMap>>;
   try {
@@ -177,7 +177,8 @@ export async function preResolveHostileMediaProxies(
     };
   });
   const total = hostileEntries.length;
-  const toMake = sources.filter((source) => !proxyCached(projectDir, source)).length;
+  const cached = sources.map((source) => proxyCached(projectDir, source));
+  const toMake = cached.filter((isCached) => !isCached).length;
   if (toMake > 0) {
     console.error(
       `[hyperframes] Making browser-playable copies of ${toMake} video${toMake === 1 ? "" : "s"} Chrome cannot decode. Only the first check of these files waits for this; later checks reuse the copies.`,
@@ -210,7 +211,14 @@ export async function preResolveHostileMediaProxies(
       ),
     );
   }
-  return { findings, failedPaths: new Set(failures.map(({ pathname }) => pathname)) };
+  const files = sources.map(({ file }, index): PreparedMediaFile => {
+    const result = results[index]!;
+    if (result.status === "rejected") {
+      return { file, state: "failed", reason: normalizeErrorMessage(result.reason) };
+    }
+    return { file, state: cached[index] ? "cached" : "ready" };
+  });
+  return { findings, failedPaths: new Set(failures.map(({ pathname }) => pathname)), files };
 }
 
 function proxyCached(
@@ -228,10 +236,18 @@ function proxyCached(
   }
 }
 
+export interface PreparedMediaFile {
+  file: string;
+  state: "ready" | "cached" | "failed";
+  reason?: string;
+}
+
 interface ProxyPreResolution {
   findings: RuntimeDraft[];
   /** Root-relative paths of the videos whose copy failed. */
   failedPaths: Set<string>;
+  /** One entry per browser-hostile video, in project order. */
+  files: PreparedMediaFile[];
 }
 
 function proxyFailedDraft(message: string): RuntimeDraft {
