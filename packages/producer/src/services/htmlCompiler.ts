@@ -1,4 +1,5 @@
 import { decodedUrlPath } from "@hyperframes/parsers/asset-paths";
+import { fetchPublicScript, ScriptFetchPolicyError } from "./externalScriptFetch.js";
 // fallow-ignore-file code-duplication complexity
 /**
  * HTML Compiler for Producer
@@ -1274,9 +1275,7 @@ export async function inlineExternalScripts(html: string): Promise<string> {
 
   const downloads = await Promise.allSettled(
     externalScripts.map(async ({ el, src }) => {
-      const response = await fetch(src, {
-        signal: AbortSignal.timeout(15_000),
-      });
+      const response = await fetchPublicScript(src, AbortSignal.timeout(15_000));
       if (!response.ok) throw new Error(`HTTP ${response.status} for ${src}`);
       const bytes = new Uint8Array(await response.arrayBuffer());
       if (!matchesScriptIntegrity(bytes, el.getAttribute("integrity") || "")) {
@@ -1306,6 +1305,10 @@ export async function inlineExternalScripts(html: string): Promise<string> {
       // A verified mismatch must never fall back to an executable external tag:
       // browser support for integrity metadata (including casing) can differ.
       if (download.reason instanceof ScriptIntegrityError) throw download.reason;
+      // Same reasoning for a policy refusal: leaving the tag in place would
+      // hand the URL to the render browser, which fetches it from the same
+      // network position the policy just refused. Fail the compile instead.
+      if (download.reason instanceof ScriptFetchPolicyError) throw download.reason;
       defaultLogger.warn(
         `[Compiler] WARNING: Failed to download CDN script: ${src} (${download.reason}). ` +
           `The render may fail if this script is required (e.g. GSAP). ` +

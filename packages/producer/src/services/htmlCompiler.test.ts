@@ -1,5 +1,5 @@
 // fallow-ignore-file code-duplication
-import { describe, expect, it, mock, beforeAll } from "bun:test";
+import { describe, expect, it, mock, beforeAll, afterAll } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { runInThisContext } from "node:vm";
 import { parseHTML } from "linkedom";
 import { interpolateVolumeGain } from "@hyperframes/core/media-volume-envelope";
+import { __setScriptHostResolverForTests } from "./externalScriptFetch.js";
 import { redactTelemetryString } from "@hyperframes/core";
 import { defaultLogger } from "../logger.js";
 import { NotMediaPayloadError } from "@hyperframes/engine";
@@ -29,6 +30,17 @@ import {
   resolveCompositionDurations,
 } from "./htmlCompiler.js";
 import { validateNoSystemFonts } from "./render/planValidation.js";
+
+// Tests in this file stub fetch() itself, so DNS is stubbed too: every host
+// resolves to a public address and the script fetch policy in
+// externalScriptFetch.ts passes. The policy's own behavior is covered in
+// externalScriptFetch.test.ts.
+beforeAll(() => {
+  __setScriptHostResolverForTests(async () => ["93.184.216.34"]);
+});
+afterAll(() => {
+  __setScriptHostResolverForTests(null);
+});
 
 describe("discoverMediaFromBrowser", () => {
   async function discover(
