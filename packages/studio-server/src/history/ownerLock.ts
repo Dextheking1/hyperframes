@@ -61,6 +61,11 @@ function beingTaken(file: string): boolean {
   }
 }
 
+/** A holder is dead only when its pid is gone and its lock is not a claimant's empty file mid-write. */
+function deadHolder(file: string, pid: number): boolean {
+  return !alive(pid) && !beingTaken(file);
+}
+
 /**
  * Takes `file` if nobody holds it: written aside and linked in, so a reader never sees it without its pid. A drive
  * without hard links (exFAT, some network drives) creates it exclusively instead; readers wait out the empty gap.
@@ -104,12 +109,12 @@ function evictDeadOwner(file: string): boolean {
   const evictor = `${file}.evict`;
   if (!claim(evictor)) {
     const holder = ownerOf(evictor);
-    if (holder !== null && !alive(holder)) rmSync(evictor, { force: true });
+    if (holder !== null && deadHolder(evictor, holder)) rmSync(evictor, { force: true });
     return false;
   }
   try {
     const pid = ownerOf(file);
-    if (pid !== null && !alive(pid) && !beingTaken(file)) rmSync(file, { force: true });
+    if (pid !== null && deadHolder(file, pid)) rmSync(file, { force: true });
     return true;
   } finally {
     releaseOwn(evictor);
@@ -141,7 +146,7 @@ function attemptClaim(file: string, urlFile: string, deadline: number): Attempt 
   if (claim(file)) return "claimed";
   const pid = ownerOf(file);
   if (pid === null) return "retry";
-  if (!alive(pid) && !beingTaken(file) && evictDeadOwner(file)) return "retry";
+  if (deadHolder(file, pid) && evictDeadOwner(file)) return "retry";
   if (Date.now() >= deadline) throw new HistoryBusyError(pid, servedBy(file, urlFile, pid));
   return "wait";
 }

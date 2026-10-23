@@ -119,6 +119,14 @@ describe("takeHistoryOwnership on a drive without hard links", () => {
     expect(existsSync(lock)).toBe(true);
   });
 
+  it("waits out an evict lock that is created but not yet written instead of removing it", async () => {
+    const home = newHome();
+    writeFileSync(join(home, "owner.pid"), "2147483646");
+    writeFileSync(join(home, "owner.pid.evict"), "");
+    await expect(takeHistoryOwnership(home, 150)).rejects.toThrow(HistoryBusyError);
+    expect(existsSync(join(home, "owner.pid.evict"))).toBe(true);
+  });
+
   it("clears an empty lock a crashed claimant left behind", async () => {
     const home = newHome();
     const lock = join(home, "owner.pid");
