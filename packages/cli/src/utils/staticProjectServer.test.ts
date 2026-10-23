@@ -363,6 +363,26 @@ describe("serveStaticProjectHtml transparent media proxies", () => {
     );
   });
 
+  it("pre-warms the copy the page will ask for, not the source-size one", async () => {
+    const projectDir = mk();
+    const html =
+      '<html><body><div data-composition-id="root" data-width="1920" data-height="1080"></div></body></html>';
+    const { injectMediaCodecMapIntoHtml } =
+      await import("@hyperframes/studio-server/media-proxy-preview");
+
+    server = await serveStaticProjectHtml(projectDir, html);
+
+    expect(injectMediaCodecMapIntoHtml).toHaveBeenLastCalledWith(
+      html,
+      projectDir,
+      [{ html }],
+      undefined,
+      true,
+      expect.any(AbortSignal),
+      { width: 2048, height: 1448 },
+    );
+  });
+
   it("resolves the copy named by hf-proxy-box, the one check made before the page opened", async () => {
     const projectDir = mk();
     writeFileSync(join(projectDir, "clip.mp4"), "original-hevc-bytes");

@@ -33,8 +33,8 @@ import type { LayoutIssue, LayoutIssueCode, LayoutRect } from "./layoutAudit.js"
 import { serveStaticProjectHtml } from "./staticProjectServer.js";
 import { collectTweenRecords, findTweenTails, tweenTailMessage } from "./gsapTweenTails.js";
 import { resolveAutoProxy } from "./projectConfig.js";
-import { findCompositionDimensions } from "./compositionViewport.js";
-import { quantizePreviewProxyBox, type PreviewProxyBox } from "@hyperframes/core";
+import { findStageProxyBox } from "./compositionViewport.js";
+import type { PreviewProxyBox } from "@hyperframes/core";
 import {
   decideMediaProxyEligibility,
   proxyVariantFor,
@@ -164,8 +164,7 @@ export async function preResolveHostileMediaProxies(
   if (hostileEntries.length === 0) return none;
 
   const startedAt = Date.now();
-  const stage = findCompositionDimensions(html);
-  const stageBox = (stage && quantizePreviewProxyBox(stage.width, stage.height)) || undefined;
+  const stageBox = findStageProxyBox(html);
   const sources = hostileEntries.map(([pathname, facts]) => {
     const file = pathname.replace(/^\/+/, "");
     return {

@@ -9,6 +9,7 @@ import {
 } from "@hyperframes/core";
 import { getMimeType } from "@hyperframes/core/studio-api";
 import { decodeWellFormedEscapes } from "@hyperframes/studio-server";
+import { findStageProxyBox } from "./compositionViewport.js";
 import { resolveAutoProxy } from "./projectConfig.js";
 import { injectMediaCodecMap } from "./compositionServer.js";
 import {
@@ -269,7 +270,15 @@ export async function serveStaticProjectHtml(
   const autoProxy = resolveAutoProxy(projectDir, autoProxyOverride);
   const copies = new AbortController();
   const servedHtml = autoProxy
-    ? await injectMediaCodecMap(html, projectDir, [{ html }], undefined, true, copies.signal)
+    ? await injectMediaCodecMap(
+        html,
+        projectDir,
+        [{ html }],
+        undefined,
+        true,
+        copies.signal,
+        findStageProxyBox(html),
+      )
     : html;
 
   // fallow-ignore-next-line complexity
