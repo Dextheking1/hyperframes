@@ -65,7 +65,7 @@ function deadHolder(file: string, pid: number): boolean {
   return !alive(pid) && !beingTaken(file);
 }
 
-/** Takes `file` if nobody holds it, linked in whole so a reader never sees it without its pid; created in place where links fail. */
+/** Takes `file` if nobody holds it: linked in whole, or created in place where links fail. */
 function claim(file: string): boolean {
   const draft = `${file}-${process.pid}-${randomUUID()}.tmp`;
   writeFileSync(draft, String(process.pid));
