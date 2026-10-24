@@ -144,4 +144,107 @@ describe("createStudioApi cross-origin write guard", () => {
     });
     expect(res.status).toBe(200);
   });
+
+  it("allows an HTTPS same-origin write", async () => {
+    const { app, projectDir } = createApp();
+    const res = await app.request("https://localhost:3002/projects/demo/files/planted.html", {
+      method: "POST",
+      headers: {
+        Host: "localhost:3002",
+        Origin: "https://localhost:3002",
+        "Content-Type": "text/plain",
+      },
+      body: "<html>planted</html>",
+    });
+    expect(res.status).toBe(201);
+    expect(existsSync(join(projectDir, "planted.html"))).toBe(true);
+  });
+
+  it("allows an HTTPS write behind a TLS proxy that forwards the proto", async () => {
+    const { app, projectDir } = createApp();
+    const res = await app.request("http://localhost:3002/projects/demo/files/planted.html", {
+      method: "POST",
+      headers: {
+        Host: "localhost:3002",
+        Origin: "https://localhost:3002",
+        "X-Forwarded-Proto": "https",
+        "Content-Type": "text/plain",
+      },
+      body: "<html>planted</html>",
+    });
+    expect(res.status).toBe(201);
+    expect(existsSync(join(projectDir, "planted.html"))).toBe(true);
+  });
+
+  it("rejects an HTTPS Origin on a request that arrived over plain HTTP", async () => {
+    const { app, projectDir } = createApp();
+    const res = await app.request("http://localhost:3002/projects/demo/files/planted.html", {
+      method: "POST",
+      headers: {
+        Host: "localhost:3002",
+        Origin: "https://localhost:3002",
+        "Content-Type": "text/plain",
+      },
+      body: "<html>planted</html>",
+    });
+    expect(res.status).toBe(403);
+    expect(existsSync(join(projectDir, "planted.html"))).toBe(false);
+  });
+
+  it("allows a write on a host named in the allowedHosts option", async () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "hf-origin-guard-"));
+    tempDirs.push(projectDir);
+    const app = createStudioApi(stubAdapter(projectDir), {
+      allowedHosts: ["studio.example.com"],
+    });
+    const res = await app.request("http://studio.example.com/projects/demo/files/planted.html", {
+      method: "POST",
+      headers: {
+        Host: "studio.example.com",
+        Origin: "https://studio.example.com",
+        "X-Forwarded-Proto": "https",
+        "Content-Type": "text/plain",
+      },
+      body: "<html>planted</html>",
+    });
+    expect(res.status).toBe(201);
+    expect(existsSync(join(projectDir, "planted.html"))).toBe(true);
+  });
+
+  it("rejects a write on that host without the allowedHosts option", async () => {
+    const { app, projectDir } = createApp();
+    const res = await app.request("http://studio.example.com/projects/demo/files/planted.html", {
+      method: "POST",
+      headers: {
+        Host: "studio.example.com",
+        Origin: "https://studio.example.com",
+        "X-Forwarded-Proto": "https",
+        "Content-Type": "text/plain",
+      },
+      body: "<html>planted</html>",
+    });
+    expect(res.status).toBe(403);
+    expect(existsSync(join(projectDir, "planted.html"))).toBe(false);
+  });
+
+  it("allows a write through a tunnel that rewrites Host and forwards its own", async () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "hf-origin-guard-"));
+    tempDirs.push(projectDir);
+    const app = createStudioApi(stubAdapter(projectDir), {
+      allowedHosts: ["demo.tunnels.example"],
+    });
+    const res = await app.request("http://localhost/projects/demo/files/planted.html", {
+      method: "POST",
+      headers: {
+        Host: "localhost",
+        Origin: "https://demo.tunnels.example",
+        "X-Forwarded-Proto": "https",
+        "X-Forwarded-Host": "demo.tunnels.example",
+        "Content-Type": "text/plain",
+      },
+      body: "<html>planted</html>",
+    });
+    expect(res.status).toBe(201);
+    expect(existsSync(join(projectDir, "planted.html"))).toBe(true);
+  });
 });

@@ -21,7 +21,6 @@ import { replaceWithProjectDirMissing } from "./helpers/projectDirMissing.js";
 import { folderGone, isProjectRootMissing } from "./helpers/safePath.js";
 import { sameOriginPost } from "./helpers/requestIdentity.js";
 
-/** Host named by a request URL, or undefined when it does not parse. */
 function urlHost(url: string): string | undefined {
   try {
     return new URL(url).host || undefined;
@@ -30,36 +29,26 @@ function urlHost(url: string): string | undefined {
   }
 }
 
-/**
- * Create a Hono sub-app with all studio API routes.
- *
- * Both the vite dev server and CLI embedded server mount this app
- * under /api, each providing their own adapter for host-specific behavior.
- */
-export function createStudioApi(adapter: StudioApiAdapter): Hono {
+function urlScheme(url: string): string | undefined {
+  try {
+    return new URL(url).protocol.replace(/:$/, "") || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export interface StudioApiOptions {
+  /**
+   * Extra host names the write guard accepts as this server, for hosts
+   * mounting the API on their own domain or behind a tunnel or proxy.
+   */
+  allowedHosts?: readonly string[];
+}
+
+export function createStudioApi(adapter: StudioApiAdapter, options: StudioApiOptions = {}): Hono {
   const api = new Hono();
-  // The studio API is unauthenticated and its only legitimate caller is the
-  // Studio page this same server serves. A state-changing request that did
-  // not come from that page is a cross-origin request from some other
-  // website open in the user's browser. CORS does not stop such requests
-  // from being SENT: POST with a text/plain or form body is "simple" and
-  // needs no preflight. It only stops the page reading the response, which
-  // a fire-and-forget file write or render trigger does not need. Reject
-  // those writes outright. Reads are unaffected: the guard covers state
-  // changes only.
-  //
-  // The predicate is the CLI server's own `sameOriginPost`, shared from
-  // helpers/requestIdentity so both servers give one answer. Comparing the
-  // Origin host to the Host header alone is not enough: a page whose own
-  // DNS name resolves to 127.0.0.1 sends a matching pair and walks through.
-  // `sameOriginPost` also requires the Host to be an identity this server
-  // answers to (a loopback literal, or the LAN name it was bound with) and
-  // refuses any Sec-Fetch-Site other than "same-origin". Callers with no
-  // Origin header (curl, tests, in-process) still pass on a loopback Host,
-  // which is the only Host a loopback-bound server can be reached on. When
-  // the Host header is absent the request never came over the wire
-  // (in-process callers address the app by URL, and a real server builds
-  // that URL from the Host header), so the URL's host is the same value.
+  // This API is unauthenticated and simple cross-origin POSTs need no
+  // preflight, so the guard rejects writes the shared predicate refuses.
   api.use(async function rejectCrossOriginWrites(c, next) {
     if (c.req.method === "GET" || c.req.method === "HEAD" || c.req.method === "OPTIONS") {
       return next();
@@ -68,6 +57,10 @@ export function createStudioApi(adapter: StudioApiAdapter): Hono {
       host: c.req.header("host") ?? urlHost(c.req.url),
       origin: c.req.header("origin"),
       fetchSite: c.req.header("sec-fetch-site"),
+      proto: urlScheme(c.req.url),
+      forwardedProto: c.req.header("x-forwarded-proto"),
+      forwardedHost: c.req.header("x-forwarded-host"),
+      allowedHosts: options.allowedHosts,
     });
     if (!allowed) return c.json({ error: "forbidden" }, 403);
     return next();

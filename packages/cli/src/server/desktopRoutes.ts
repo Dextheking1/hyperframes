@@ -7,9 +7,14 @@ import {
 } from "../utils/desktopApp.js";
 import { sameOriginPost } from "@hyperframes/studio-server/request-identity";
 
-// Re-exported for this module's tests; the definition is shared with
-// the studio API's write guard.
-export { sameOriginPost };
+/** Scheme of a request URL ("http" or "https"), or undefined when it does not parse. */
+function urlSchemeOf(url: string): string | undefined {
+  try {
+    return new URL(url).protocol.replace(/:$/, "") || undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 const CTA_ID = /^[A-Za-z0-9-]{1,64}$/;
 
@@ -40,6 +45,9 @@ export function mountDesktopRoutes(
       host: c.req.header("host"),
       origin: c.req.header("origin"),
       fetchSite: c.req.header("sec-fetch-site"),
+      proto: urlSchemeOf(c.req.url),
+      forwardedProto: c.req.header("x-forwarded-proto"),
+      forwardedHost: c.req.header("x-forwarded-host"),
     });
     if (!allowed) return c.json({ error: "forbidden" }, 403);
     if (!ready)
