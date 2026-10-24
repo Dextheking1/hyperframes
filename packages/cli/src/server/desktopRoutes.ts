@@ -5,21 +5,13 @@ import {
   desktopInstalled,
   openInDesktop,
 } from "../utils/desktopApp.js";
-import { identityAllowed } from "./telemetryIdentity.js";
+import { sameOriginPost } from "@hyperframes/studio-server/request-identity";
+
+// Re-exported for this module's tests; the definition is shared with
+// the studio API's write guard.
+export { sameOriginPost };
 
 const CTA_ID = /^[A-Za-z0-9-]{1,64}$/;
-
-/** A bodiless POST is a simple request, so any page can send one to localhost: it has to come from this Studio. */
-export function sameOriginPost(headers: {
-  host?: string;
-  origin?: string;
-  fetchSite?: string;
-}): boolean {
-  const { host, origin, fetchSite } = headers;
-  if (!host || !identityAllowed(host)) return false;
-  if (fetchSite && fetchSite !== "same-origin") return false;
-  return origin === undefined || origin === `http://${host}`;
-}
 
 /** The desktop-app button's route: show it or not, the download, and whether the app here takes the project. */
 export function mountDesktopRoutes(

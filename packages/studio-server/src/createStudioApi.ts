@@ -19,23 +19,15 @@ import { registerGlobalAssetRoutes } from "./routes/globalAssets.js";
 import { registerHistoryRoutes } from "./routes/history.js";
 import { replaceWithProjectDirMissing } from "./helpers/projectDirMissing.js";
 import { folderGone, isProjectRootMissing } from "./helpers/safePath.js";
+import { sameOriginPost } from "./helpers/requestIdentity.js";
 
-/**
- * Whether a state-changing request's Origin names the host the request was
- * sent to. No Origin header means a non-browser caller (curl, tests,
- * in-process), which is allowed. An unparseable Origin (including the
- * literal "null" a sandboxed page sends) names no host this server serves,
- * so it never matches.
- */
-function writeOriginAllowed(origin: string | undefined, host: string | undefined): boolean {
-  if (origin === undefined) return true;
-  let originHost: string | null = null;
+/** Host named by a request URL, or undefined when it does not parse. */
+function urlHost(url: string): string | undefined {
   try {
-    originHost = new URL(origin).host;
+    return new URL(url).host || undefined;
   } catch {
-    originHost = null;
+    return undefined;
   }
-  return !!originHost && !!host && originHost.toLowerCase() === host.toLowerCase();
 }
 
 /**
@@ -47,27 +39,37 @@ function writeOriginAllowed(origin: string | undefined, host: string | undefined
 export function createStudioApi(adapter: StudioApiAdapter): Hono {
   const api = new Hono();
   // The studio API is unauthenticated and its only legitimate caller is the
-  // Studio page this same server serves. A state-changing request that
-  // carries an Origin naming a different host than the request's Host did
-  // not come from that page: it is a cross-origin request from some other
+  // Studio page this same server serves. A state-changing request that did
+  // not come from that page is a cross-origin request from some other
   // website open in the user's browser. CORS does not stop such requests
   // from being SENT: POST with a text/plain or form body is "simple" and
   // needs no preflight. It only stops the page reading the response, which
   // a fire-and-forget file write or render trigger does not need. Reject
-  // those writes outright. Requests with no Origin header (curl, tests,
-  // in-process callers) are not browser traffic and keep working, as do
-  // reads: the guard covers state changes only.
+  // those writes outright. Reads are unaffected: the guard covers state
+  // changes only.
+  //
+  // The predicate is the CLI server's own `sameOriginPost`, shared from
+  // helpers/requestIdentity so both servers give one answer. Comparing the
+  // Origin host to the Host header alone is not enough: a page whose own
+  // DNS name resolves to 127.0.0.1 sends a matching pair and walks through.
+  // `sameOriginPost` also requires the Host to be an identity this server
+  // answers to (a loopback literal, or the LAN name it was bound with) and
+  // refuses any Sec-Fetch-Site other than "same-origin". Callers with no
+  // Origin header (curl, tests, in-process) still pass on a loopback Host,
+  // which is the only Host a loopback-bound server can be reached on. When
+  // the Host header is absent the request never came over the wire
+  // (in-process callers address the app by URL, and a real server builds
+  // that URL from the Host header), so the URL's host is the same value.
   api.use(async function rejectCrossOriginWrites(c, next) {
     if (c.req.method === "GET" || c.req.method === "HEAD" || c.req.method === "OPTIONS") {
       return next();
     }
-    // Fetch Metadata: a cross-site request is refused even when the Origin
-    // header was stripped (some same-site-but-cross-origin setups send
-    // Sec-Fetch-Site: same-site, which stays allowed).
-    const crossSite = c.req.header("sec-fetch-site") === "cross-site";
-    if (crossSite || !writeOriginAllowed(c.req.header("origin"), c.req.header("host"))) {
-      return c.json({ error: "forbidden" }, 403);
-    }
+    const allowed = sameOriginPost({
+      host: c.req.header("host") ?? urlHost(c.req.url),
+      origin: c.req.header("origin"),
+      fetchSite: c.req.header("sec-fetch-site"),
+    });
+    if (!allowed) return c.json({ error: "forbidden" }, 403);
     return next();
   });
   api.use(async function answerProjectDirMissingAfterErrorHandlers(c, next) {

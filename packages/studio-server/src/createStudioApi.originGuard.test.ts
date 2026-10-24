@@ -85,6 +85,40 @@ describe("createStudioApi cross-origin write guard", () => {
     expect(res.status).toBe(403);
   });
 
+  it("rejects a write from a DNS name pointing at loopback, even when Origin and Host match", async () => {
+    // The attacker's page is served from a name that resolves to 127.0.0.1,
+    // so its Origin and Host agree with each other and a guard that only
+    // compares the pair lets it through. The shared predicate also requires
+    // the Host to be an identity this server answers to, and
+    // "rebind.example" is not one, whatever it resolves to.
+    const { app, projectDir } = createApp();
+    const res = await createFile(app, {
+      Host: "rebind.example:9999",
+      Origin: "http://rebind.example:9999",
+      "Sec-Fetch-Site": "same-origin",
+      "Content-Type": "text/plain",
+    });
+    expect(res.status).toBe(403);
+    expect(existsSync(join(projectDir, "planted.html"))).toBe(false);
+  });
+
+  it("rejects a write with no Origin when the Host is a DNS name, not a server identity", async () => {
+    const { app, projectDir } = createApp();
+    const res = await createFile(app, { Host: "rebind.example:9999" });
+    expect(res.status).toBe(403);
+    expect(existsSync(join(projectDir, "planted.html"))).toBe(false);
+  });
+
+  it("rejects a same-site write even when Origin and Host match", async () => {
+    const { app } = createApp();
+    const res = await createFile(app, {
+      Origin: "http://localhost",
+      "Sec-Fetch-Site": "same-site",
+      "Content-Type": "text/plain",
+    });
+    expect(res.status).toBe(403);
+  });
+
   it("allows a same-origin write (Origin host matches Host)", async () => {
     const { app, projectDir } = createApp();
     const res = await createFile(app, {
