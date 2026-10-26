@@ -49,6 +49,7 @@ import {
   envInt,
   isDeParallelRouterEnabled,
   mergeWorkerInitObservability,
+  PROBE_READ_TIMEOUT_MS,
   resolveCompositionElementCount,
   detectAdaptersStatic,
   resolveAdaptersUsed,
@@ -176,6 +177,93 @@ describe("executeDiskCaptureWithAdaptiveRetry — zero-progress bail (integratio
       expect(executeParallelCapture).toHaveBeenCalledTimes(1);
     } finally {
       rmSync(workDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { interleaveFrames: true, strides: [3, 3, 3], starts: [10, 11, 12] },
+    {
+      interleaveFrames: undefined,
+      strides: [undefined, undefined, undefined],
+      starts: [10, 14, 18],
+    },
+  ])(
+    "hands workers $starts as start frames when interleaveFrames=$interleaveFrames",
+    async ({ interleaveFrames, strides, starts }) => {
+      vi.mocked(executeParallelCapture).mockResolvedValue([]);
+      vi.mocked(mergeWorkerFrames).mockResolvedValue(undefined);
+      const workDir = mkdtempSync(join(tmpdir(), "hf-dist-work-"));
+      const framesDir = mkdtempSync(join(tmpdir(), "hf-dist-frames-"));
+      try {
+        await executeDiskCaptureWithAdaptiveRetry({
+          serverUrl: "http://localhost:0",
+          workDir,
+          framesDir,
+          totalFrames: 12,
+          initialWorkerCount: 3,
+          allowRetry: false,
+          frameExt: "jpg",
+          captureOptions: {} as CaptureOptions,
+          createBeforeCaptureHook: () => null,
+          cfg: {} as EngineConfig,
+          log: makeLog(),
+          dedupPerfs: [],
+          frameRangeStart: 10,
+          interleaveFrames,
+        }).catch(() => {});
+        const tasks = vi.mocked(executeParallelCapture).mock.calls[0]?.[2] ?? [];
+        expect(tasks.map((t) => t.startFrame)).toEqual(starts);
+        expect(tasks.map((t) => t.frameStride)).toEqual(strides);
+      } finally {
+        rmSync(workDir, { recursive: true, force: true });
+        rmSync(framesDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("retries a dead interleaved worker's frames as one stride task, not one batch per frame", async () => {
+    // 4 workers over 24 frames: worker 2 owns 2, 6, 10, 14, 18, 22 and dies after 10.
+    const workDir = mkdtempSync(join(tmpdir(), "hf-il-retry-work-"));
+    const framesDir = mkdtempSync(join(tmpdir(), "hf-il-retry-frames-"));
+    const write = (frames: number[]) =>
+      frames.forEach((i) =>
+        writeFileSync(join(framesDir, formatCaptureFrameName(i, "jpg")), "captured-frame"),
+      );
+    const all = Array.from({ length: 24 }, (_, i) => i);
+    vi.mocked(mergeWorkerFrames).mockResolvedValue(undefined);
+    vi.mocked(executeParallelCapture)
+      .mockImplementationOnce(async () => {
+        write(all.filter((i) => ![14, 18, 22].includes(i)));
+        throw new Error("Protocol error (Page.captureScreenshot): Target closed");
+      })
+      .mockImplementation(async () => {
+        write(all);
+        return [];
+      });
+    try {
+      await executeDiskCaptureWithAdaptiveRetry({
+        serverUrl: "http://localhost:0",
+        workDir,
+        framesDir,
+        totalFrames: 24,
+        initialWorkerCount: 4,
+        allowRetry: true,
+        frameExt: "jpg",
+        captureOptions: {} as CaptureOptions,
+        createBeforeCaptureHook: () => null,
+        cfg: {} as EngineConfig,
+        log: makeLog(),
+        dedupPerfs: [],
+        interleaveFrames: true,
+      });
+      expect(executeParallelCapture).toHaveBeenCalledTimes(2);
+      const retryTasks = vi.mocked(executeParallelCapture).mock.calls[1]?.[2] ?? [];
+      expect(retryTasks.map((t) => [t.startFrame, t.endFrame, t.frameStride])).toEqual([
+        [14, 23, 4],
+      ]);
+    } finally {
+      rmSync(workDir, { recursive: true, force: true });
+      rmSync(framesDir, { recursive: true, force: true });
     }
   });
 
@@ -1631,6 +1719,23 @@ describe("adaptive missing-frame retry helpers", () => {
     ]);
   });
 
+  it("packs each dead interleaved worker's frames into one stride task, offset by the chunk start", () => {
+    const missing = [2, 6, 10, 14, 3, 7]
+      .sort((x, y) => x - y)
+      .map((f) => ({ startFrame: f, endFrame: f + 1 }));
+    const tasks = (maxWorkers: number) =>
+      buildMissingFrameRetryBatches(missing, maxWorkers, "/w", 1, 100, 4).map((batch) =>
+        batch.map((t) => [t.startFrame, t.endFrame, t.frameStride, t.outputFrameOffset]),
+      );
+    expect(tasks(4)).toEqual([
+      [
+        [102, 115, 4, 100],
+        [103, 108, 4, 100],
+      ],
+    ]);
+    expect(tasks(1)).toEqual([[[102, 115, 4, 100]], [[103, 108, 4, 100]]]);
+  });
+
   it("retries a worker placeholder instead of accepting a truncated sequence", () => {
     const framesDir = makeFramesDir();
     for (let frameIndex = 0; frameIndex < 4; frameIndex++) {
@@ -1868,7 +1973,6 @@ describe("resolveDeviceScaleFactor", () => {
 describe("shouldPreferSingleWorkerDrawElement (DE priority inversion)", () => {
   const eligible = {
     workerCount: 5,
-    requestedWorkers: "auto" as const,
     useDrawElement: true,
     deCompileGate: undefined,
     forceScreenshot: false,
@@ -1929,7 +2033,6 @@ describe("shouldPreferSingleWorkerDrawElement (DE priority inversion)", () => {
 
     it("is NOT decisive when the render is ineligible for any other reason — the attribution cohort must exclude renders the band cannot affect", () => {
       for (const over of [
-        { requestedWorkers: 3 as const },
         { useDrawElement: false },
         { deCompileGate: "css_effect:filter" },
         { forceScreenshot: true },
@@ -2499,6 +2602,27 @@ describe("shouldPreferSingleWorkerDrawElement (DE priority inversion)", () => {
   });
 
   describe("resolveCompositionElementCount", () => {
+    it("returns the static answer and warns when the live read never answers", async () => {
+      vi.useFakeTimers();
+      try {
+        const warn = vi.fn();
+        const session = {
+          isInitialized: true,
+          page: { evaluate: () => new Promise<never>(() => {}) },
+        };
+        const pending = resolveCompositionElementCount(session, "<div><span></span></div>", {
+          warn,
+        });
+        await vi.advanceTimersByTimeAsync(PROBE_READ_TIMEOUT_MS);
+        const resolved = await pending;
+        expect(resolved.source).toBe("static");
+        expect(resolved.count).toBe(2);
+        expect(warn).toHaveBeenCalledOnce();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     // Review finding (R3): a static scan of SOURCE markup cannot see DOM a
     // composition's own script creates at runtime (document.createElement) —
     // an unbounded undercount no regex can close. style-10-prod's real
@@ -2673,6 +2797,23 @@ describe("shouldPreferSingleWorkerDrawElement (DE priority inversion)", () => {
   });
 
   describe("resolveAdaptersUsed", () => {
+    it("returns the static adapters and warns when the live read never answers", async () => {
+      vi.useFakeTimers();
+      try {
+        const warn = vi.fn();
+        const session = {
+          isInitialized: true,
+          page: { evaluate: () => new Promise<never>(() => {}) },
+        };
+        const pending = resolveAdaptersUsed(session, "<script>gsap.timeline();</script>", { warn });
+        await vi.advanceTimersByTimeAsync(PROBE_READ_TIMEOUT_MS);
+        expect(await pending).toEqual(["gsap"]);
+        expect(warn).toHaveBeenCalledOnce();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it("falls back to the static scan when there is no probe session", async () => {
       const html = "<script>gsap.timeline();</script>";
       expect(await resolveAdaptersUsed(null, html)).toEqual(["gsap"]);
@@ -2735,14 +2876,14 @@ describe("shouldPreferSingleWorkerDrawElement (DE priority inversion)", () => {
     });
   });
 
-  it("honors explicitly requested workers", () => {
-    expect(shouldPreferSingleWorkerDrawElement({ ...eligible, requestedWorkers: 3 })).toBe(false);
+  it("inverts whatever worker count the render asked for: an explicit --workers N is a ceiling", () => {
+    for (const workerCount of [2, 3, 4, 24]) {
+      expect(shouldPreferSingleWorkerDrawElement({ ...eligible, workerCount })).toBe(true);
+    }
   });
 
-  it("inverts for requestedWorkers undefined — the value production actually passes for auto", () => {
-    expect(shouldPreferSingleWorkerDrawElement({ ...eligible, requestedWorkers: undefined })).toBe(
-      true,
-    );
+  it("leaves a one-worker render alone", () => {
+    expect(shouldPreferSingleWorkerDrawElement({ ...eligible, workerCount: 1 })).toBe(false);
   });
 
   it("skips comps routed to layered/HDR/shader paths (drawElement never runs there)", () => {

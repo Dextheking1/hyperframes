@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, type ReadStream } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Server } from "node:http";
+import fs from "node:fs";
+import { get, Server } from "node:http";
+import { syncBuiltinESMExports } from "node:module";
 import {
   inProcessAnswer,
   serveStaticProjectHtml,
@@ -131,12 +133,30 @@ afterEach(async () => {
   mocks.decideMediaProxyEligibility.mockReturnValue({ eligible: true });
 });
 
-async function serveWith(bytes: Buffer): Promise<{ url: string }> {
+const TAGGED_PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAABGNJQ1ABAQABlXPCVgAAAAxJREFUeJxj0NfXBwABHgCOTp25kgAAAABJRU5ErkJggg==",
+  "base64",
+);
+
+async function serveWith(bytes: Buffer, name = "tone.wav"): Promise<{ url: string }> {
   dir = mkdtempSync(join(tmpdir(), "hf-static-"));
-  writeFileSync(join(dir, "tone.wav"), bytes);
+  writeFileSync(join(dir, name), bytes);
   server = await serveStaticProjectHtml(dir, "<html></html>");
   return { url: server.url };
 }
+
+describe("serveStaticProjectHtml colour-tagged PNGs", () => {
+  it("serves a BT.709-tagged PNG without the tag, so check and snapshot see the file's values", async () => {
+    const { url } = await serveWith(TAGGED_PNG, "tagged.png");
+
+    const res = await fetch(`${url}tagged.png`);
+    const body = Buffer.from(await res.arrayBuffer());
+
+    expect(body.includes("cICP")).toBe(false);
+    expect(body.includes("IDAT")).toBe(true);
+    expect(res.headers.get("content-length")).toBe(String(body.length));
+  });
+});
 
 describe("serveStaticProjectHtml range support", () => {
   it("answers a Range request with 206 + the requested byte slice", async () => {
@@ -211,6 +231,70 @@ describe("serveStaticProjectHtml range support", () => {
     const res = await fetch(`${url}tone.wav`, { headers: { Range: "bytes=99-200" } });
     expect(res.status).toBe(416);
     expect(res.headers.get("content-range")).toBe(`bytes */${body.length}`);
+  });
+});
+
+describe("serveStaticProjectHtml asset stream lifetime", () => {
+  it.each([
+    { label: "full", range: undefined, proxy: false },
+    { label: "open-ended range", range: "bytes=1048576-", proxy: false },
+    { label: "bounded range", range: "bytes=0-16777215", proxy: false },
+    { label: "proxy", range: undefined, proxy: true },
+  ])("closes a $label asset when its client disconnects", async ({ range, proxy }) => {
+    dir = mkdtempSync(join(tmpdir(), "hf-static-disconnect-"));
+    const assetPath = join(dir, "large.mp4");
+    writeFileSync(assetPath, "x");
+    fs.truncateSync(assetPath, 32 * 1024 * 1024);
+    mocks.resolveProxy.mockResolvedValue(assetPath);
+    server = await serveStaticProjectHtml(dir, "<html></html>");
+
+    const createStream = fs.createReadStream;
+    const streams: ReadStream[] = [];
+    const spy = vi.spyOn(fs, "createReadStream").mockImplementation((...args) => {
+      const stream = createStream(...args);
+      streams.push(stream);
+      return stream;
+    });
+    syncBuiltinESMExports();
+
+    try {
+      const status = await new Promise<number | undefined>((resolve, reject) => {
+        const req = get(
+          `${server?.url}large.mp4${proxy ? "?hf-proxy=h264" : ""}`,
+          { headers: range ? { Range: range } : {} },
+          (response) => {
+            response.on("data", () => {
+              response.destroy();
+              req.destroy();
+              resolve(response.statusCode);
+            });
+            response.on("error", reject);
+          },
+        );
+        req.on("error", reject);
+      });
+
+      expect(status).toBe(range ? 206 : 200);
+      expect(streams).toHaveLength(1);
+      await expect.poll(() => streams[0]?.closed, { timeout: 1500, interval: 10 }).toBe(true);
+      expect(streams[0]?.destroyed).toBe(true);
+      expect((await fetch(server.url)).status).toBe(200);
+    } finally {
+      await Promise.all(
+        streams.map(
+          (stream) =>
+            new Promise<void>((resolve) => {
+              if (stream.closed) resolve();
+              else {
+                stream.once("close", resolve);
+                stream.destroy();
+              }
+            }),
+        ),
+      );
+      spy.mockRestore();
+      syncBuiltinESMExports();
+    }
   });
 });
 
@@ -362,6 +446,58 @@ describe("serveStaticProjectHtml transparent media proxies", () => {
       { signal: expect.any(AbortSignal) },
     );
   });
+
+  it("pre-warms the copy the page will ask for, not the source-size one", async () => {
+    const projectDir = mk();
+    const html =
+      '<html><body><div data-composition-id="root" data-width="1920" data-height="1080"></div></body></html>';
+    const { injectMediaCodecMapIntoHtml } =
+      await import("@hyperframes/studio-server/media-proxy-preview");
+
+    server = await serveStaticProjectHtml(projectDir, html);
+
+    expect(injectMediaCodecMapIntoHtml).toHaveBeenLastCalledWith(
+      html,
+      projectDir,
+      [{ html }],
+      undefined,
+      true,
+      expect.any(AbortSignal),
+      { width: 2048, height: 1218 },
+    );
+  });
+
+  it("resolves the copy named by hf-proxy-box, the one check made before the page opened", async () => {
+    const projectDir = mk();
+    writeFileSync(join(projectDir, "clip.mp4"), "original-hevc-bytes");
+    const proxyPath = join(projectDir, "proxy.mp4");
+    writeFileSync(proxyPath, "boxed-h264-bytes");
+    mocks.resolveProxy.mockResolvedValue(proxyPath);
+    server = await serveStaticProjectHtml(projectDir, "<html></html>");
+
+    const res = await fetch(`${server.url}clip.mp4?hf-proxy=h264&hf-proxy-box=2048x1448`);
+
+    expect(await res.text()).toBe("boxed-h264-bytes");
+    expect(mocks.resolveProxy).toHaveBeenCalledWith(
+      projectDir,
+      join(projectDir, "clip.mp4"),
+      "h264",
+      { width: 2048, height: 1448 },
+      { signal: expect.any(AbortSignal) },
+    );
+  });
+
+  it.each(["clip.mp4?hf-proxy=h264&hf-proxy-box=1000x1000", "clip.mp4?hf-proxy-box=2048x1448"])(
+    "answers 404 without a copy for %s, as the Studio preview does",
+    async (path) => {
+      const projectDir = mk();
+      writeFileSync(join(projectDir, "clip.mp4"), "original-hevc-bytes");
+      server = await serveStaticProjectHtml(projectDir, "<html></html>");
+
+      expect((await fetch(`${server.url}${path}`)).status).toBe(404);
+      expect(mocks.resolveProxy).not.toHaveBeenCalled();
+    },
+  );
 
   it.each(["mxf", "mts", "m2ts", "ts", "mkv", "m4v"])(
     "serves a proxy for .%s camera/container media",

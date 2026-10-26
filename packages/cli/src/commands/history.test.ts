@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { spawn } from "node:child_process";
+import { spawn, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -36,6 +36,33 @@ const clock = { at: 0 };
 const advance = (ms: number) => void (clock.at += ms);
 
 const tracked = vi.hoisted(() => [] as Array<{ action: string; via: string }>);
+const outputRace = vi.hoisted(() => ({ enabled: false, replacements: 0 }));
+vi.mock("node:child_process", async (importOriginal) => {
+  const original = await importOriginal<typeof import("node:child_process")>();
+  const { renameSync, writeFileSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  return {
+    ...original,
+    spawnSync(
+      command: string,
+      args: readonly string[],
+      options: SpawnSyncOptionsWithStringEncoding,
+    ) {
+      const result = original.spawnSync(command, args, options);
+      if (
+        outputRace.enabled &&
+        command === "git" &&
+        args[0] === "diff" &&
+        typeof options.cwd === "string"
+      ) {
+        renameSync(join(options.cwd, "diff"), join(options.cwd, "written-diff"));
+        writeFileSync(join(options.cwd, "diff"), "replacement-file-content");
+        outputRace.replacements++;
+      }
+      return result;
+    },
+  };
+});
 vi.mock("../telemetry/events.js", () => ({
   trackHistoryAction: (props: { action: string; via: string }) => tracked.push(props),
 }));
@@ -156,6 +183,27 @@ describe.each(["direct", "preview"])("hyperframes history (%s)", (mode) => {
     return { ...p, personWrites };
   }
 
+  it("refuses an empty start restore with exit 2 and leaves files intact", async () => {
+    const p = project();
+    rmSync(join(p.dir, "index.html"));
+    rmSync(join(p.dir, "notes.html"));
+    const history = await openProjectHistory({
+      projectDir: p.dir,
+      historyRoot: historyDeps.historyRoot,
+      now: () => clock.at,
+    });
+    p.write("index.html", "A");
+    p.write("notes.html", "N");
+    await history.close();
+    if (mode === "preview") await preview(p.dir);
+    const result = await p.hf("restore", "start");
+    expect(result.code).toBe(2);
+    expect(result.err).toBe(
+      "Restoring this point would remove every file in this project, so nothing was changed.",
+    );
+    expect(p.files()).toEqual(["A", "N"]);
+  });
+
   it("an agent's labelled turn, a person's edit after it: --since shows both, undo of the turn keeps the edit", async () => {
     const { json, hf, turn, personWrites, files } = await setup();
     const startedAt = new Date(clock.at - 1).toISOString();
@@ -240,6 +288,37 @@ describe.each(["direct", "preview"])("hyperframes history (%s)", (mode) => {
     expect((await hf("show", entry.id)).out).toContain("M index.html");
     const diff = (await hf("show", entry.id.slice(0, 8), "--diff")).out;
     expect(diff).toMatch(/-A\n\\ No newline at end of file\n\+A2/);
+  });
+
+  it.each([false, true])("shows a large text diff completely (json=%s)", async (json) => {
+    const { hf, turn } = await setup();
+    const before = `before-${"a".repeat(600_000)}-end-before\n`;
+    const after = `after-${"b".repeat(600_000)}-end-after-🎬\n`;
+    await turn("claude", "Write notes", "notes.html", before);
+    const entry = await turn("claude", "Rewrite notes", "notes.html", after);
+
+    const result = await hf("show", entry.id, "--diff", ...(json ? ["--json"] : []));
+
+    expect(result.code, result.err).toBe(0);
+    const diff = json ? JSON.parse(result.out).diff : result.out;
+    expect(diff).toContain(`-${before}+${after.trimEnd()}`);
+  });
+
+  it("reads the written diff when its pathname is replaced after Git exits", async () => {
+    const { hf, turn } = await setup();
+    const entry = await turn("claude", "Retitle", "index.html", "A2");
+    outputRace.enabled = true;
+    outputRace.replacements = 0;
+    try {
+      const result = await hf("show", entry.id, "--diff", "--json");
+
+      expect(outputRace.replacements).toBe(1);
+      expect(result.code, result.err).toBe(0);
+      expect(JSON.parse(result.out).diff).toMatch(/-A\n\\ No newline at end of file\n\+A2/);
+      expect(result.out).not.toContain("replacement-file-content");
+    } finally {
+      outputRace.enabled = false;
+    }
   });
 
   it("peek reads a file as it was without writing, and restore puts every file back", async () => {

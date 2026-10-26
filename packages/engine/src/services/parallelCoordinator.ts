@@ -7,7 +7,8 @@
 
 import { cpus, freemem } from "os";
 import { existsSync, mkdirSync, readdirSync } from "fs";
-import { copyFile, readFile, rename } from "fs/promises";
+import { copyFile, readFile } from "fs/promises";
+import { renameWithRetryAsync } from "../utils/renameWithRetry.js";
 import { join } from "path";
 import { getHeapStatistics } from "v8";
 
@@ -78,6 +79,8 @@ export interface WorkerResult {
   perf?: CapturePerfSummary;
   error?: string;
   diagnostics?: string[];
+  /** The worker session's `[Browser:PAGEERROR]` console lines, kept so the render's error count sees them. */
+  pageErrorLines?: string[];
   failure?: CaptureFailure;
 }
 
@@ -608,7 +611,7 @@ async function captureFrameRange(
       if (signal?.aborted) throw new Error("Parallel worker cancelled");
       const time = (i * captureOptions.fps.den) / captureOptions.fps.num;
       if (dbg && i < task.startFrame + dbgWin) {
-        console.log(`[par:w${task.workerId}] +${Date.now() - dbgT0}ms produce ${i} start`);
+        console.error(`[par:w${task.workerId}] +${Date.now() - dbgT0}ms produce ${i} start`);
       }
       const { encodeResult } = await runCaptureOperation("frame_capture", i, () =>
         captureFrameToBufferPipelined(session, i - outputOffset, time),
@@ -620,23 +623,25 @@ async function captureFrameRange(
       // and would otherwise surface as an unhandled rejection during teardown.
       encodeResult.catch(() => {});
       if (dbg && i < task.startFrame + dbgWin) {
-        console.log(`[par:w${task.workerId}] +${Date.now() - dbgT0}ms produce ${i} kicked`);
+        console.error(`[par:w${task.workerId}] +${Date.now() - dbgT0}ms produce ${i} kicked`);
       }
       if (prev) {
         if (dbg && prev.idx < task.startFrame + dbgWin) {
-          console.log(
+          console.error(
             `[par:w${task.workerId}] +${Date.now() - dbgT0}ms drain ${prev.idx} await-encode`,
           );
         }
         const buf = await awaitEncode(prev.idx, prev.encodeResult);
         if (dbg && prev.idx < task.startFrame + dbgWin) {
-          console.log(
+          console.error(
             `[par:w${task.workerId}] +${Date.now() - dbgT0}ms drain ${prev.idx} encoded ${buf.length}B`,
           );
         }
         await onFrameBuffer(prev.idx, buf, session);
         if (dbg && prev.idx < task.startFrame + dbgWin) {
-          console.log(`[par:w${task.workerId}] +${Date.now() - dbgT0}ms drain ${prev.idx} written`);
+          console.error(
+            `[par:w${task.workerId}] +${Date.now() - dbgT0}ms drain ${prev.idx} written`,
+          );
         }
         framesCaptured++;
         if (onFrameCaptured) onFrameCaptured(task.workerId, prev.idx);
@@ -711,7 +716,7 @@ export function selectVerifySampleIndicesForTask(
  */
 /** HF_DE_PAR_DEBUG=1 gated per-worker trace line (message built lazily). */
 function logParDebug(message: () => string): void {
-  if (process.env.HF_DE_PAR_DEBUG === "1") console.log(message());
+  if (process.env.HF_DE_PAR_DEBUG === "1") console.error(message());
 }
 
 /**
@@ -733,7 +738,7 @@ function assertDiskSampleAboveFloor(
       { kind: "psnr", frameIndex: idx, failedDb: db, verifyThresholdDb: verifyMinDb },
     );
   }
-  console.log(
+  console.error(
     `[Parallel] drawElement disk self-verify passed (worker ${workerId}, frame ${idx}, ` +
       `${db === Infinity ? "inf" : db.toFixed(1)}dB)`,
   );
@@ -940,6 +945,7 @@ async function executeWorkerTask(
       frameStride: task.frameStride,
       durationMs: Date.now() - startTime,
       perf,
+      pageErrorLines: pageErrorLinesOf(activeSession),
     };
   } catch (error) {
     const diagnostics = session ? selectWorkerDiagnostics(session.browserConsoleBuffer) : [];
@@ -953,6 +959,7 @@ async function executeWorkerTask(
     const failure = classifyCaptureFailure(error, {
       signal,
       workerDiagnostics: [workerDiagnostic],
+      pageErrorLines: session ? pageErrorLinesOf(session) : undefined,
     });
     onFailure?.(failure);
     return {
@@ -965,6 +972,7 @@ async function executeWorkerTask(
       perf,
       error: failure.message,
       diagnostics: diagnostics.length > 0 ? diagnostics : undefined,
+      pageErrorLines: session ? pageErrorLinesOf(session) : undefined,
       failure,
     };
   } finally {
@@ -1013,6 +1021,10 @@ export interface ParallelCaptureHooks {
    * frame (the ordered writer) with the original error, not a stall.
    */
   onWorkerFailure?: (failure: CaptureFailure) => void;
+}
+
+function pageErrorLinesOf(session: CaptureSession): string[] {
+  return session.browserConsoleBuffer.filter((line) => line.includes("PAGEERROR"));
 }
 
 /**
@@ -1111,10 +1123,11 @@ export async function executeParallelCapture(
     captureOptions.deVerifySamples,
     tasks.length,
   );
-  const workerCaptureOptions: CaptureOptions =
-    deVerifySamples === captureOptions.deVerifySamples
-      ? captureOptions
-      : { ...captureOptions, deVerifySamples };
+  const workerCaptureOptions: CaptureOptions = {
+    ...captureOptions,
+    deVerifySamples,
+    deFrameFallback: false,
+  };
   const peerController = new AbortController();
   const workerSignal = signal
     ? AbortSignal.any([signal, peerController.signal])
@@ -1156,6 +1169,7 @@ export async function executeParallelCapture(
       message: `[Parallel] Capture failed: ${errorMessages}`,
       cause: representative,
       workerDiagnostics,
+      pageErrorLines: [...new Set(results.flatMap((result) => result.pageErrorLines ?? []))],
     });
   }
 
@@ -1184,7 +1198,7 @@ export async function mergeWorkerFrames(
       const sourcePath = join(task.outputDir, file);
       const targetPath = join(outputDir, file);
       try {
-        await rename(sourcePath, targetPath);
+        await renameWithRetryAsync(sourcePath, targetPath);
       } catch {
         await copyFile(sourcePath, targetPath);
       }

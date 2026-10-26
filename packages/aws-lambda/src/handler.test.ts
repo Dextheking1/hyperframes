@@ -255,6 +255,19 @@ describe("unwrapEvent", () => {
 });
 
 describe("handler dispatch", () => {
+  it("answers a warm event without touching S3 or the project", async () => {
+    const s3 = new FakeS3Client();
+    expect(
+      await handleEvent(
+        { Action: "warm" },
+        { s3: s3 as unknown as import("@aws-sdk/client-s3").S3Client, skipChromeResolution: true },
+      ),
+    ).toEqual({
+      Action: "warm",
+    });
+    expect(s3.ops).toEqual([]);
+  });
+
   it("preserves explicit v1 plan compatibility", async () => {
     const tmpRoot = makeTmpRoot();
     const s3 = new FakeS3Client();
@@ -754,8 +767,11 @@ describe("handler dispatch", () => {
     }
     const options = renderChunkMock.mock.calls.map((call) => (call as unknown[])[3]);
     expect(options).toEqual([
-      { maxCaptureWorkers: undefined },
-      { maxCaptureWorkers: Math.max(1, Math.min(5, availableParallelism() - 1)) },
+      { maxCaptureWorkers: undefined, interleaveCapture: true },
+      {
+        maxCaptureWorkers: Math.max(1, Math.min(5, availableParallelism() - 1)),
+        interleaveCapture: true,
+      },
     ]);
     const captures = logged
       .filter((line) => line.includes('"chunk_capture"'))

@@ -14,6 +14,7 @@ import { resolveProject, type ProjectDir } from "../utils/project.js";
 import { normalizeErrorMessage } from "../utils/errorMessage.js";
 import type { ProjectLintResult } from "../utils/lintProject.js";
 import { resolveCompositionViewportFromHtml } from "../utils/compositionViewport.js";
+import { resolveNaturalMediaTimelineDuration } from "@hyperframes/core";
 import { c } from "../ui/colors.js";
 import { decodeWellFormedEscapes } from "@hyperframes/studio-server";
 import { printDeprecationNotice, withMeta } from "../utils/updateCheck.js";
@@ -142,7 +143,7 @@ export function raceMediaReady(
  * can't see.
  */
 export async function auditClipDurations(
-  page: import("puppeteer-core").Page,
+  page: Pick<import("puppeteer-core").Page, "evaluate">,
   analyzeClipMediaFit: typeof import("@hyperframes/engine").analyzeClipMediaFit,
   extraWaitMs: number,
 ): Promise<ConsoleEntry[]> {
@@ -163,21 +164,30 @@ export async function auditClipDurations(
     // snapshot. Elements that already have a duration resolve immediately, so
     // this adds no latency in the common case.
     const deadline = Date.now() + maxWaitMs;
+    const reads = new Map<HTMLMediaElement, HTMLMediaElement>();
     await Promise.all(
       nodes.map((el) => {
         if (Number.isFinite(el.duration) && el.duration > 0) return Promise.resolve();
+        const probe = new Audio();
+        probe.preload = "metadata";
+        probe.src = el.currentSrc || el.src || el.querySelector("source")?.src || "";
+        reads.set(el, probe);
         return new Promise<void>((resolve) => {
           const cleanup = () => {
-            el.removeEventListener("loadedmetadata", onReady);
-            el.removeEventListener("error", onReady);
+            for (const target of [el, probe]) {
+              target.removeEventListener("loadedmetadata", onReady);
+              target.removeEventListener("error", onReady);
+            }
             clearTimeout(timer);
           };
           const onReady = () => {
             cleanup();
             resolve();
           };
-          el.addEventListener("loadedmetadata", onReady, { once: true });
-          el.addEventListener("error", onReady, { once: true });
+          for (const target of [el, probe]) {
+            target.addEventListener("loadedmetadata", onReady, { once: true });
+            target.addEventListener("error", onReady, { once: true });
+          }
           const timer = setTimeout(onReady, Math.max(0, deadline - Date.now()));
         });
       }),
@@ -187,7 +197,7 @@ export async function auditClipDurations(
       id: string;
       kind: string;
       slot: number;
-      mediaStart: number;
+      attributes: Record<string, string | null>;
       duration: number;
       loop: boolean;
     }> = [];
@@ -198,8 +208,15 @@ export async function auditClipDurations(
         id: el.id || el.getAttribute("src") || `(${el.tagName.toLowerCase()})`,
         kind: el.tagName === "AUDIO" ? "Audio" : "Video",
         slot,
-        mediaStart: parseFloat(el.getAttribute("data-media-start") ?? "0") || 0,
-        duration: el.duration,
+        attributes: {
+          "data-media-start": el.getAttribute("data-media-start"),
+          "data-playback-start": el.getAttribute("data-playback-start"),
+          "data-playback-rate": el.getAttribute("data-playback-rate"),
+          "data-automation": el.getAttribute("data-automation"),
+        },
+        duration: Number.isFinite(el.duration)
+          ? el.duration
+          : (reads.get(el)?.duration ?? Number.NaN),
         loop: el.loop || el.getAttribute("data-loop") === "true",
       });
     }
@@ -215,7 +232,11 @@ export async function auditClipDurations(
       unreadable.push(clip.id);
       continue;
     }
-    const mediaSeconds = Math.max(0, clip.duration - clip.mediaStart);
+    const mediaSeconds = resolveNaturalMediaTimelineDuration(
+      { getAttribute: (name) => clip.attributes[name] ?? null },
+      clip.duration,
+    );
+    if (mediaSeconds === null) continue;
     const fit = analyzeClipMediaFit({ slotSeconds: clip.slot, mediaSeconds, loop: clip.loop });
     if (!fit) continue;
     warnings.push({

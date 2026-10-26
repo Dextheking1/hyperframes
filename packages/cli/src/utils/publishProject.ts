@@ -12,7 +12,8 @@ import {
 import { parseHTML } from "linkedom";
 import AdmZip from "adm-zip";
 import ignore, { type Ignore } from "ignore";
-import { CSS_URL_RE, isNonRelativeUrl, isPathInside } from "@hyperframes/core";
+import { CSS_URL_RE, isNonRelativeUrl, isPathInside, rewriteSrcsetUrls } from "@hyperframes/core";
+import { decodeUrlPathVariants, encodeUrlPath } from "@hyperframes/parsers";
 import { buildAuthHeaders } from "../auth/client.js";
 import { tryResolveCredential } from "../auth/index.js";
 import { isAuthError } from "../auth/errors.js";
@@ -434,14 +435,17 @@ function tryResolveExternal(
   referrerAbsDir: string,
 ): string | null {
   if (isNonRelativeUrl(rawPath)) return null;
-  const absPath = resolve(referrerAbsDir, rawPath);
-  if (isPathInside(absPath, ctx.absProjectDir)) return null;
-  try {
-    if (!existsSync(absPath) || !statSync(absPath).isFile()) return null;
-  } catch {
-    return null;
+  for (const path of decodeUrlPathVariants(rawPath)) {
+    const absPath = resolve(referrerAbsDir, path);
+    if (isPathInside(absPath, ctx.absProjectDir)) return null;
+    try {
+      if (!existsSync(absPath) || !statSync(absPath).isFile()) continue;
+    } catch {
+      continue;
+    }
+    return encodeUrlPath(addExternalAsset(ctx, absPath));
   }
-  return addExternalAsset(ctx, absPath);
+  return null;
 }
 
 /** Resolves a raw attribute or CSS `url()` value to the archive path or absolute
@@ -538,13 +542,37 @@ export function rewriteStyleBlocks(
   return modified;
 }
 
+function rewriteHtmlSrcsets(
+  document: Document,
+  referrerAbsDir: string,
+  entryPath: string,
+  resolveTarget: HtmlAttributeResolver,
+): boolean {
+  let modified = false;
+  for (const el of document.querySelectorAll("[srcset]")) {
+    const srcset = el.getAttribute("srcset");
+    if (!srcset) continue;
+    const rewritten = rewriteSrcsetUrls(srcset, (url) => {
+      const target = resolveTarget(url, referrerAbsDir);
+      return target ? referenceFrom(entryPath, target) : url;
+    });
+    if (rewritten === srcset) continue;
+    el.setAttribute("srcset", rewritten);
+    modified = true;
+  }
+  return modified;
+}
+
 function localizeHtmlEntry(ctx: ExternalAssetContext, entryPath: string, content: Buffer): void {
   const referrerAbsDir = resolve(ctx.absProjectDir, dirname(entryPath));
   const { document } = parseHTML(content.toString("utf-8"));
   const resolveTarget: HtmlAttributeResolver = (val, dir) => tryResolveExternal(ctx, val, dir);
-  const attrsChanged = rewriteHtmlAttributes(document, referrerAbsDir, entryPath, resolveTarget);
+  const attrsChanged = rewriteHtmlAttributes(document, referrerAbsDir, entryPath, resolveTarget, {
+    attrs: ["src", "href", "poster"],
+  });
   const stylesChanged = rewriteStyleBlocks(document, referrerAbsDir, entryPath, resolveTarget);
-  if (attrsChanged || stylesChanged) {
+  const srcsetsChanged = rewriteHtmlSrcsets(document, referrerAbsDir, entryPath, resolveTarget);
+  if (attrsChanged || stylesChanged || srcsetsChanged) {
     ctx.fileContents.set(entryPath, Buffer.from(document.toString(), "utf-8"));
   }
 }

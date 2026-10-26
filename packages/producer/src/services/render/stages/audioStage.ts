@@ -25,6 +25,7 @@ import {
   audioFailureDiagnostics,
   processCompositionAudio,
   type AudioProcessingFailure,
+  type MixResult,
 } from "@hyperframes/engine";
 import type { CompositionMetadata } from "../shared.js";
 import type { ProducerLogger } from "../../../logger.js";
@@ -47,6 +48,7 @@ export interface AudioStageInput {
   audios: CompositionMetadata["audios"];
   masterFxChain?: string;
   urlByAbsentLocalPath?: ReadonlyMap<string, string>;
+  audioSidecarUrlByLocalPath?: ReadonlyMap<string, string>;
   abortSignal: AbortSignal | undefined;
   assertNotAborted: () => void;
   /** Where a per-track failure's detail goes. Optional so tests need not pass one. */
@@ -70,6 +72,8 @@ export interface AudioStageResult {
   audioError?: string;
   /** Bounded typed causes for policy, telemetry, and caller classification. */
   audioFailures?: AudioProcessingFailure[];
+  /** Wall ms per phase of the audio mix. */
+  audioPhaseMs?: MixResult["phaseMs"];
 }
 
 function assertAudioNotInterrupted(failures: readonly AudioProcessingFailure[] | undefined): void {
@@ -93,6 +97,7 @@ export async function runAudioStage(input: AudioStageInput): Promise<AudioStageR
     const result = await mixAudioForDelivery(input, duration, pcmSourcePath);
     let audioLoweredDb: number | undefined;
     if (result.hasAudio) {
+      const guardStart = Date.now();
       const peak = await constrainAacTruePeak({
         audioPath: result.audioOutputPath,
         sourcePath: pcmSourcePath,
@@ -102,6 +107,7 @@ export async function runAudioStage(input: AudioStageInput): Promise<AudioStageR
       });
       if (!peak.success) throw encoderFailureError("Audio true-peak check failed", peak);
       audioLoweredDb = peak.loweredDb;
+      input.log?.info("[audio] phases", { ...result.audioPhaseMs, guard: Date.now() - guardStart });
     }
     return { ...result, audioLoweredDb, audioProcessMs: Date.now() - stageStart };
   } finally {
@@ -123,6 +129,7 @@ async function mixAudioForDelivery(
     audios,
     masterFxChain,
     urlByAbsentLocalPath,
+    audioSidecarUrlByLocalPath,
     abortSignal,
     assertNotAborted,
     log,
@@ -132,6 +139,7 @@ async function mixAudioForDelivery(
   let hasAudio = false;
   let audioError: string | undefined;
   let audioFailures: AudioProcessingFailure[] | undefined;
+  let audioPhaseMs: MixResult["phaseMs"];
 
   if (audios.length > 0) {
     // processCompositionAudio reports per-track failures in its result, but an FX
@@ -154,6 +162,7 @@ async function mixAudioForDelivery(
           audioGain,
           masterFxChain,
           urlByAbsentLocalPath,
+          audioSidecarUrlByLocalPath,
           keepEncoderInputAt: pcmSourcePath,
         },
         compiledDir,
@@ -190,6 +199,7 @@ async function mixAudioForDelivery(
 
     hasAudio = audioResult.success;
     audioFailures = audioResult.failures;
+    audioPhaseMs = audioResult.phaseMs;
     // processCompositionAudio's error (per-element failures or the mix's own
     // error) used to be discarded here — the caller only saw hasAudio flip to
     // false with no explanation, so a real audio failure looked identical to
@@ -218,5 +228,6 @@ async function mixAudioForDelivery(
     hasAudio,
     audioError,
     audioFailures,
+    audioPhaseMs,
   };
 }

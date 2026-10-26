@@ -87,6 +87,22 @@ describe("describePageMotionBlur", () => {
     );
   });
 
+  it("names the tier that drew the blur, so a fallback is visible in the log", async () => {
+    vi.stubGlobal("window", {
+      __hfMotionBlur: {
+        report: () => ({
+          state: "on",
+          tier: "filter",
+          reasonCode: "accelerated-canvas",
+          movers: 2,
+        }),
+      },
+    });
+    expect(await describePageMotionBlur(inPage)).toBe(
+      "[motion-blur] on reasonCode=accelerated-canvas movers=2 failedFrames=0 tier=filter",
+    );
+  });
+
   it('carries the frames that fell back to plain DOM, so "on" cannot hide them', async () => {
     vi.stubGlobal("window", {
       __hfMotionBlur: {
@@ -147,7 +163,8 @@ describe("closeCaptureSession", () => {
   afterEach(() => vi.restoreAllMocks());
 
   it("logs the blur's closing line once, before the page closes", async () => {
-    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const stdout = vi.spyOn(console, "log").mockImplementation(() => {});
     const order: string[] = [];
     vi.stubGlobal("window", {
       __hfMotionBlur: {
@@ -172,6 +189,7 @@ describe("closeCaptureSession", () => {
       "[motion-blur] on reasonCode=null movers=1 failedFrames=2 (session end)",
     ]);
     expect(order).toEqual(["read", "close"]);
+    expect(stdout).not.toHaveBeenCalled();
     vi.unstubAllGlobals();
   });
 });

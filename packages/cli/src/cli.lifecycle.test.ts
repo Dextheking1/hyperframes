@@ -1,15 +1,30 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { mockTelemetry } from "./cliDispatchTestUtils.js";
 
 const originalArgv = [...process.argv];
 const originalExitCode = process.exitCode;
 
-afterEach(() => {
+// The first import of the CLI's module graph is slow on a cold Windows runner; pay it here, not in a test.
+beforeAll(async () => {
+  await Promise.all([
+    import("citty"),
+    import("@hyperframes/core/figma"),
+    import("./telemetry/client.js"),
+    import("./utils/command-failure-tracking.js"),
+    import("./utils/project.js"),
+    import("./utils/render-success-state.js"),
+  ]);
+}, 120_000);
+
+afterEach(async () => {
   process.argv = [...originalArgv];
   process.exitCode = originalExitCode;
+  // The CLI starts background imports it never awaits; one still loading when the registry resets
+  // splits a module in two, and the next test's error class no longer matches its own.
+  await vi.dynamicImportSettled();
   for (const path of MOCKED_MODULES) vi.doUnmock(path);
   vi.resetModules();
 });
@@ -128,6 +143,32 @@ describe("CLI lifecycle", () => {
         expect.objectContaining({ error_name: "NO_TOKEN", command: "figma:asset" }),
       ]);
     });
+  });
+
+  it("runs `open` for a bare project folder, and keeps `render` a command", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hf-cli-shortcut-"));
+    const run = vi.fn();
+    try {
+      for (const [name, argv] of [
+        ["open", [dir]],
+        ["open", ["--verbose", dir]],
+        ["render", ["render"]],
+      ] as const) {
+        vi.doMock(`./commands/${name}.js`, () => ({
+          default: { meta: { name }, args: { dir: { type: "positional", required: false } }, run },
+        }));
+        mockTelemetry();
+        process.argv = ["node", "cli.ts", ...argv];
+        await import("./cli.js");
+        await vi.dynamicImportSettled();
+        vi.doUnmock(`./commands/${name}.js`);
+        vi.resetModules();
+      }
+      expect(run.mock.calls.map(([ctx]) => ctx.rawArgs)).toEqual([[dir], [dir], []]);
+      expect(process.argv.slice(2)).toEqual(["render"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("hands queued events to flushSync even after finalizeCli has run", async () => {
@@ -318,6 +359,32 @@ describe("CLI lifecycle", () => {
 
     await vi.waitFor(() => expect(launchBackgroundChecks).toHaveBeenCalledTimes(1));
     expect(checkForUpdate).not.toHaveBeenCalled();
+  });
+});
+
+describe("stale-skills notice under --json", () => {
+  it("prints on a --json run while the self-update notices stay off", async () => {
+    const printSkillsUpdateNotice = vi.fn();
+    const printUpdateNotice = vi.fn();
+    mockInitCommand(vi.fn());
+    mockTelemetry();
+    vi.doMock("./utils/autoUpdate.js", () => ({
+      reportCompletedUpdate: vi.fn(),
+      scheduleBackgroundInstall: vi.fn(),
+    }));
+    vi.doMock("./utils/updateCheck.js", () => ({
+      cachedUpdateCheck: () => ({ current: "1.0.0", latest: "1.0.0", updateAvailable: false }),
+      printUpdateNotice,
+      printStalePinNotice: vi.fn(),
+    }));
+    vi.doMock("./utils/skillsUpdateCheck.js", () => ({ printSkillsUpdateNotice }));
+    vi.doMock("./utils/backgroundChecks.js", () => ({ launchBackgroundChecks: vi.fn() }));
+
+    process.argv = ["node", "cli.ts", "init", "--json"];
+    await import("./cli.js");
+
+    await vi.waitFor(() => expect(printSkillsUpdateNotice).toHaveBeenCalledTimes(1));
+    expect(printUpdateNotice).not.toHaveBeenCalled();
   });
 });
 

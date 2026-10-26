@@ -1,4 +1,4 @@
-import { Hono } from "hono";
+import { Hono, type Context, type Next } from "hono";
 import type { StudioApiAdapter } from "./types.js";
 import { registerProjectRoutes } from "./routes/projects.js";
 import { registerFileRoutes } from "./routes/files.js";
@@ -20,6 +20,19 @@ import { registerHistoryRoutes } from "./routes/history.js";
 import { replaceWithProjectDirMissing } from "./helpers/projectDirMissing.js";
 import { folderGone, isProjectRootMissing } from "./helpers/safePath.js";
 import { sameOriginPost } from "./helpers/requestIdentity.js";
+import { previewErrorPage } from "./helpers/previewErrorPage.js";
+
+async function answerRefusedFrameWithPage(c: Context, next: Next) {
+  await next();
+  if (c.req.header("sec-fetch-dest") !== "iframe" || c.res.status < 400) return;
+  const headers = new Headers(c.res.headers);
+  headers.set("content-type", "text/html; charset=utf-8");
+  headers.delete("content-length");
+  c.res = new Response(previewErrorPage(c.res.status), {
+    status: c.res.status,
+    headers,
+  });
+}
 
 function urlHost(url: string): string | undefined {
   try {
@@ -65,6 +78,8 @@ export function createStudioApi(adapter: StudioApiAdapter, options: StudioApiOpt
     if (!allowed) return c.json({ error: "forbidden" }, 403);
     return next();
   });
+  api.use("/projects/:id/preview/*", answerRefusedFrameWithPage);
+  api.use("/projects/:id/preview", answerRefusedFrameWithPage);
   api.use(async function answerProjectDirMissingAfterErrorHandlers(c, next) {
     const hostHeaders = new Headers(c.res.headers);
     await next();

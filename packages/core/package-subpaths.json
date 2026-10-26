@@ -56,6 +56,12 @@
       "types": "./dist/safePath.d.ts",
       "environments": ["bun", "node"]
     },
+    "./browser-marker": {
+      "source": "./src/browserMarker.ts",
+      "runtime": "./dist/browserMarker.js",
+      "types": "./dist/browserMarker.d.ts",
+      "environments": ["bun", "node"]
+    },
     "./atomic-file": {
       "source": "./src/atomicFile.ts",
       "runtime": "./dist/atomicFile.js",
@@ -108,6 +114,18 @@
       "source": "./src/htmlInCanvas.ts",
       "runtime": "./dist/htmlInCanvas.js",
       "types": "./dist/htmlInCanvas.d.ts",
+      "environments": ["browser", "bun", "node"]
+    },
+    "./motion-blur-settings": {
+      "source": "./src/motionBlurSettings.ts",
+      "runtime": "./dist/motionBlurSettings.js",
+      "types": "./dist/motionBlurSettings.d.ts",
+      "environments": ["browser", "bun", "node"]
+    },
+    "./preview-quality": {
+      "source": "./src/previewProxyBox.ts",
+      "runtime": "./dist/previewProxyBox.js",
+      "types": "./dist/previewProxyBox.d.ts",
       "environments": ["browser", "bun", "node"]
     },
     "./gsap-cdn": {
@@ -368,6 +386,18 @@
       "types": "./dist/runtime/clipWindow.d.ts",
       "environments": ["browser", "bun", "node"]
     },
+    "./runtime/media-clock": {
+      "source": "./src/runtime/mediaClock.ts",
+      "runtime": "./dist/runtime/mediaClock.js",
+      "types": "./dist/runtime/mediaClock.d.ts",
+      "environments": ["browser", "bun", "node"]
+    },
+    "./runtime/clip-reveal": {
+      "source": "./src/runtime/clipReveal.ts",
+      "runtime": "./dist/runtime/clipReveal.js",
+      "types": "./dist/runtime/clipReveal.d.ts",
+      "environments": ["browser", "bun", "node"]
+    },
     "./runtime/stacking-context": {
       "source": "./src/runtime/stackingContext.ts",
       "runtime": "./dist/runtime/stackingContext.js",
@@ -391,6 +421,12 @@
       "runtime": "./dist/compiler/htmlDocument.js",
       "types": "./dist/compiler/htmlDocument.d.ts",
       "environments": ["browser", "bun", "node"]
+    },
+    "./compiler/png-colour-tags": {
+      "source": "./src/compiler/pngColourTags.ts",
+      "runtime": "./dist/compiler/pngColourTags.js",
+      "types": "./dist/compiler/pngColourTags.d.ts",
+      "environments": ["bun", "node"]
     },
     "./runtime/position-edits": {
       "source": "./src/runtime/positionEdits.ts",

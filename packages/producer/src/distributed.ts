@@ -140,6 +140,17 @@ export {
   validateVariablesPayload,
 } from "./services/distributed/renderConfigValidation.js";
 export { hashProjectDir, listSiteFiles } from "./services/distributed/projectHash.js";
+export {
+  AUDIO_SIDECAR_MIN_BYTES,
+  buildAudioSidecar,
+  wantsAudioSidecar,
+  type AudioSidecarOutcome,
+} from "./services/distributed/audioSidecar.js";
+export {
+  buildProbeFacts,
+  wantsProbeFacts,
+  type ProbeFactsOutcome,
+} from "./services/distributed/probeFacts.js";
 
 // ── Plan protocol compatibility ────────────────────────────────────────────
 // Workers validate this descriptor before consuming layout-specific

@@ -3,7 +3,7 @@ import {
   compositionStyle,
   cssStyleMergeKey,
   deferScriptsUntilFonts,
-  UNCONDITIONAL_CSS_KEY,
+  isAlwaysAppliedStyle,
   headStyleRuns,
   INLINED_FILE_ATTR,
   inlineScriptRuns,
@@ -17,6 +17,7 @@ import {
   planCompositionAssembly,
 } from "./compositionAssembly";
 import { SCENE_FONTS_ATTR, SCENE_PART_ATTR } from "../sceneParts";
+import { stripSdrPngColourTags } from "./pngColourTags";
 import {
   ensureExternalScriptTag,
   readExternalScriptAttributes,
@@ -41,6 +42,7 @@ import {
   splitUrlSuffix,
 } from "@hyperframes/parsers/asset-paths";
 import { CSS_URL_RE, isNonRelativeUrl } from "./assetPaths.js";
+import { rewriteSrcsetUrls } from "./srcset.js";
 import { compileHtml, type MediaDurationProber } from "./htmlCompiler";
 import {
   RUNTIME_BOOTSTRAP_ATTR,
@@ -65,6 +67,7 @@ import { readDeclaredDefaults } from "../runtime/getVariables";
 import {
   ensureExternalLinkTag,
   inlineSubCompositions,
+  isLibraryCopy,
   refuseSwapsReachedByRootScripts,
 } from "./inlineSubCompositions";
 import { isSafePath, resolveWithinProject } from "../safePath.js";
@@ -181,22 +184,6 @@ function rebaseRelativePath(urlValue: string, fromDir: string, toDir: string): s
   return appendSuffixToUrl(rebased, suffix);
 }
 
-function rebaseSrcsetPaths(srcsetValue: string, fromDir: string, toDir: string): string {
-  if (!srcsetValue) return srcsetValue;
-  return srcsetValue
-    .split(",")
-    .map((rawCandidate) => {
-      const candidate = rawCandidate.trim();
-      if (!candidate) return candidate;
-      const parts = candidate.split(/\s+/);
-      const first = parts[0] ?? "";
-      if (parts.length === 0 || !isRelativeUrl(first)) return candidate;
-      parts[0] = rebaseRelativePath(first, fromDir, toDir);
-      return parts.join(" ");
-    })
-    .join(", ");
-}
-
 function rebaseColorGradingLutPath(value: string, fromDir: string, toDir: string): string {
   if (!value.trim().startsWith("{")) return value;
   let parsed: unknown;
@@ -244,7 +231,13 @@ function rebaseEntryAuthoredAssetPaths(
   }
   for (const el of [...document.querySelectorAll("[srcset]")]) {
     const srcset = el.getAttribute("srcset");
-    if (srcset) el.setAttribute("srcset", rebaseSrcsetPaths(srcset, sourceDir, projectDir));
+    if (srcset)
+      el.setAttribute(
+        "srcset",
+        rewriteSrcsetUrls(srcset, (url) =>
+          isRelativeUrl(url) ? rebaseRelativePath(url, sourceDir, projectDir) : url,
+        ),
+      );
   }
   for (const el of [...document.querySelectorAll(`[${HF_COLOR_GRADING_ATTR}]`)]) {
     const value = el.getAttribute(HF_COLOR_GRADING_ATTR);
@@ -260,7 +253,7 @@ function inlineCssFile(
   css: string,
   cssFileDir: string,
   projectDir: string,
-  visited: Set<string> = new Set(),
+  activeImports: Set<string>,
 ): string {
   const { result: strippedCss, restore: restoreComments } = withCommentsStripped(css, (s) => s);
   const importPlaceholders: string[] = [];
@@ -273,11 +266,12 @@ function inlineCssFile(
       // @import is resolved relative to the CSS file, but must stay within the
       // project root; isSafePath also blocks symlink escapes (content is inlined).
       if (!isSafePath(projectDir, resolved)) return full;
-      if (visited.has(resolved)) return "";
+      if (activeImports.has(resolved)) return "";
       const content = safeReadFile(resolved);
       if (content == null) return full;
-      visited.add(resolved);
-      const inlined = inlineCssFile(content, dirname(resolved), projectDir, visited);
+      activeImports.add(resolved);
+      const inlined = inlineCssFile(content, dirname(resolved), projectDir, activeImports);
+      activeImports.delete(resolved);
       const trimmedMedia = (mediaQuery || "").trim();
       const block = trimmedMedia ? `@media ${trimmedMedia} {\n${inlined}\n}\n` : inlined + "\n";
       const idx = importPlaceholders.length;
@@ -359,6 +353,9 @@ const INLINE_MIME: Record<string, string> = {
  */
 const MAX_INLINE_ASSET_BYTES = 2 * 1024 * 1024;
 
+// An asset is inlined once per reference, so repeats can pass V8's ~2^29-char string limit.
+const MAX_INLINED_BUNDLE_CHARS = 256 * 1024 * 1024;
+
 function safeStatSize(filePath: string): number | null {
   try {
     return statSync(filePath).size;
@@ -374,6 +371,12 @@ function warnAssetTooLargeToInline(assetPath: string, byteLength: number): void 
   );
 }
 
+function warnInlineBudgetExhausted(assetPath: string): void {
+  console.warn(
+    `[HyperFrames] Not inlining "${assetPath}" and later assets: the bundle already inlines ${MAX_INLINED_BUNDLE_CHARS / (1024 * 1024)} MB of data URLs. The bundle may not be self-contained.`,
+  );
+}
+
 type AssetInliner = (urlValue: string) => string | null;
 type InlinableAsset = { dataUrl: string | null } | { tooLarge: number };
 
@@ -383,12 +386,15 @@ function createAssetInliner(
   inlineAssets: boolean,
 ): AssetInliner {
   const assets = new Map<string, InlinableAsset>();
+  let inlinedChars = 0;
+  let budgetExhausted = false;
   const readAsset = (filePath: string, mimeType: string): InlinableAsset => {
     // Size-check before reading: an oversized asset must not be pulled into memory
     // just to be discarded.
     const byteLength = safeStatSize(filePath);
     if (byteLength !== null && byteLength > MAX_INLINE_ASSET_BYTES) return { tooLarge: byteLength };
-    const content = safeReadFileBuffer(filePath);
+    const read = safeReadFileBuffer(filePath);
+    const content = read && mimeType === "image/png" ? (stripSdrPngColourTags(read) ?? read) : read;
     return {
       dataUrl: content === null ? null : `data:${mimeType};base64,${content.toString("base64")}`,
     };
@@ -414,7 +420,15 @@ function createAssetInliner(
       warnAssetTooLargeToInline(basePath, asset.tooLarge);
       return null;
     }
-    return asset.dataUrl === null ? null : appendSuffixToUrl(asset.dataUrl, suffix);
+    if (asset.dataUrl === null) return null;
+    if (budgetExhausted || inlinedChars + asset.dataUrl.length > MAX_INLINED_BUNDLE_CHARS) {
+      if (!budgetExhausted) warnInlineBudgetExhausted(basePath);
+      budgetExhausted = true;
+      return null;
+    }
+    inlinedChars += asset.dataUrl.length;
+    const hashIdx = suffix.indexOf("#");
+    return hashIdx < 0 ? asset.dataUrl : `${asset.dataUrl}${suffix.slice(hashIdx)}`;
   };
 }
 
@@ -469,22 +483,6 @@ function rewriteColorGradingLutWithInlinedAssets(value: string, inlineAsset: Ass
   }
   Reflect.set(lut, "src", inlined);
   return JSON.stringify(parsed);
-}
-
-function rewriteSrcsetWithInlinedAssets(srcsetValue: string, inlineAsset: AssetInliner): string {
-  if (!srcsetValue) return srcsetValue;
-  return srcsetValue
-    .split(",")
-    .map((rawCandidate) => {
-      const candidate = rawCandidate.trim();
-      if (!candidate) return candidate;
-      const parts = candidate.split(/\s+/);
-      if (parts.length === 0) return candidate;
-      const maybeInlined = inlineAsset(parts[0] ?? "");
-      if (maybeInlined) parts[0] = maybeInlined;
-      return parts.join(" ");
-    })
-    .join(", ");
 }
 
 function rewriteCssUrlsWithInlinedAssets(cssText: string, inlineAsset: AssetInliner): string {
@@ -727,10 +725,6 @@ function placeSceneStylesLikeRender(document: Document): void {
   const holder = document.createElement("style");
   holder.textContent = hoisted;
   first.before(holder);
-}
-
-function isAlwaysAppliedStyle(el: Element): boolean {
-  return cssStyleMergeKey(el) === UNCONDITIONAL_CSS_KEY && !el.closest("template, noscript, svg");
 }
 
 type PartRun<T> = { scene?: string; chunks: T[] };
@@ -1138,7 +1132,7 @@ async function bundleProject(projectDir: string, options?: BundleOptions): Promi
       const value = el.getAttribute(name);
       if (value !== null) style.setAttribute(name, value);
     }
-    style.textContent = inlineCssFile(css, dirname(cssPath), projectDir);
+    style.textContent = inlineCssFile(css, dirname(cssPath), projectDir, new Set([cssPath]));
     el.replaceWith(style);
   }
 
@@ -1152,7 +1146,8 @@ async function bundleProject(projectDir: string, options?: BundleOptions): Promi
       ].map((el) => {
         const src = el.getAttribute("src");
         const path = src && isRelativeUrl(src) ? resolveEntryUrl(src) : null;
-        return src ? (path && safeReadFile(path)) || "" : el.textContent || "";
+        const text = src ? (path && safeReadFile(path)) || "" : el.textContent || "";
+        return isLibraryCopy(text) ? "" : text;
       })
     : [];
 
@@ -1191,6 +1186,10 @@ async function bundleProject(projectDir: string, options?: BundleOptions): Promi
     },
     flattenInnerRoot: prepareFlattenedInnerRoot,
     tagScenes: options?.sceneParts === true,
+    readProjectScript: (path: string) => {
+      const resolved = isRelativeUrl(path) ? resolveEntryUrl(path) : null;
+      return resolved ? safeReadFile(resolved) : null;
+    },
     readVariableDefaults: readDeclaredDefaults,
     parseHostVariables: parseHostVariableValues,
     buildScopeSelector: (compId: string) => cssAttributeSelector("data-composition-id", compId),
@@ -1214,6 +1213,10 @@ async function bundleProject(projectDir: string, options?: BundleOptions): Promi
     ...subCompResult.variablesByComp,
   };
   const seenCompScriptSrcs = new Set<string>();
+  const scenesBySrc = new Map<string, Set<string | undefined>>();
+  for (const item of subCompResult.scriptItems)
+    if (item.kind !== "inline")
+      scenesBySrc.set(item.src, (scenesBySrc.get(item.src) ?? new Set()).add(item.scene));
   for (const scriptItem of subCompResult.scriptItems) {
     if (scriptItem.kind === "inline") {
       pushRun(scriptRuns, scriptItem.scene, scriptItem.content);
@@ -1227,13 +1230,15 @@ async function bundleProject(projectDir: string, options?: BundleOptions): Promi
     }
     if (seenCompScriptSrcs.has(extSrc)) continue;
     seenCompScriptSrcs.add(extSrc);
+    // Run once for the film when scenes share it: a scene mounts without the one that loaded it first.
+    const scene = (scenesBySrc.get(extSrc)?.size ?? 0) > 1 ? undefined : scriptItem.scene;
     if (isRelativeUrl(extSrc) && scriptItem.type !== "module") {
       const jsPath = resolveEntryUrl(extSrc);
       const js = jsPath ? safeReadFile(jsPath) : null;
       if (js != null) {
         const chunk = () =>
           preserveLocalScriptIntegrity(document, extSrc, resolveEntryUrl) ? "" : js;
-        pushRun(scriptRuns, scriptItem.scene, chunk);
+        pushRun(scriptRuns, scene, chunk);
         continue;
       }
     }
@@ -1449,7 +1454,11 @@ async function bundleProject(projectDir: string, options?: BundleOptions): Promi
   }
   for (const el of [...document.querySelectorAll("[srcset]")]) {
     const srcset = el.getAttribute("srcset");
-    if (srcset) el.setAttribute("srcset", rewriteSrcsetWithInlinedAssets(srcset, inlineAsset));
+    if (srcset)
+      el.setAttribute(
+        "srcset",
+        rewriteSrcsetUrls(srcset, (url) => inlineAsset(url) ?? url),
+      );
   }
   // Before inlining, so postcss reads paths not font bytes.
   const liveStyles = [...document.querySelectorAll("style")].filter(isAlwaysAppliedStyle);

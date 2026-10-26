@@ -28,6 +28,7 @@ import {
   readMediaStart,
   redactTelemetryString,
   resolveNaturalMediaTimelineDurationFromValues,
+  rewriteAssetPath,
   rewriteAssetPaths,
   rewriteCssAssetUrls,
   rewriteInlineStyleAssetUrls,
@@ -36,7 +37,9 @@ import {
   type UnresolvedElement,
 } from "@hyperframes/core";
 import { MAX_AUDIO_GAIN } from "@hyperframes/core/audio-gain";
-import { gsapCdnDist } from "@hyperframes/core/gsap-cdn";
+import { readPlaybackRate } from "@hyperframes/parsers/media-duration";
+import { resolveRateSpec } from "@hyperframes/core/speed-ramp";
+import { gsapCdnDist, normalizeGsapBaseUrl } from "@hyperframes/core/gsap-cdn";
 import {
   assignBundledRuntimeCompositionIds,
   assignMediaRenderIds,
@@ -53,6 +56,8 @@ import {
   readDeclaredDefaults,
   parseHostVariableValues,
   headStyleRuns,
+  isAlwaysAppliedStyle,
+  dedupeFontFaceRules,
   inlineScriptRuns,
   parsesAsScript,
   styleElementsFor,
@@ -69,7 +74,7 @@ import {
 } from "@hyperframes/parsers/asset-resolution";
 import { extractMediaMetadata, extractAudioMetadata } from "../utils/ffprobe.js";
 import { isPathInside, toExternalAssetKey } from "../utils/paths.js";
-import { collectRenderMedia } from "./renderMediaCollector.js";
+import { collectHiddenVideoIds, collectRenderMedia } from "./renderMediaCollector.js";
 import {
   type VideoElement,
   type ImageElement,
@@ -95,6 +100,7 @@ import {
   normalizeSystemFontPrimaryFamilies,
 } from "@hyperframes/core/fonts/embed";
 import { prepareAnimatedGifInputs } from "./animatedGifPrep.js";
+import { prepareHeifImageInputs } from "./heifImagePrep.js";
 import { createStudioPositionSeekReapplyScript } from "@hyperframes/studio-server/manual-edits-render-script";
 import { getPositionEditsRenderScript } from "@hyperframes/core/runtime/position-edits-render";
 import { defaultLogger, type ProducerLogger } from "../logger.js";
@@ -123,8 +129,6 @@ export interface CompiledComposition {
   hasShaderTransitions: boolean;
   /** Author HTML/CSS/scripts use a CSS 3D rendering context (pre-CDN-inline scan). */
   usesThreeDTransforms: boolean;
-  /** Author HTML/CSS use mix-blend-mode (pre-CDN-inline scan). */
-  usesMixBlendMode: boolean;
   /** Ancestors of the composition root carry a background-image (gradient/url). */
   hasAncestorBackgroundImage: boolean;
 }
@@ -406,12 +410,6 @@ export function detectThreeDTransformUsage(html: string): boolean {
   return THREE_D_CONTEXT_PATTERN.test(html);
 }
 
-const MIX_BLEND_MODE_PATTERN = /mix-blend-mode\s*:/i;
-
-function detectMixBlendModeUsage(html: string): boolean {
-  return MIX_BLEND_MODE_PATTERN.test(html);
-}
-
 /** A background declaration whose value paints an image (gradient or url). */
 const BACKGROUND_IMAGE_DECL_PATTERN =
   /(?:^|;|\{)\s*background(?:-image)?\s*:[^;}]*(?:\bgradient\s*\(|url\s*\()/i;
@@ -669,9 +667,10 @@ async function compileHtmlFile(
   // Phase 2: Bound authored audio to playable source (parallel ffprobe).
   // Explicit video slots may outlive their source and hold the final frame.
   const preResolved = extractResolvedMedia(compiledHtml);
+  const hiddenVideoIds = collectHiddenVideoIds(compiledHtml);
   const clampResults = await Promise.all(
     preResolved
-      .filter((el) => !!el.src && !el.loop)
+      .filter((el) => !!el.src && !el.loop && !hiddenVideoIds.has(el.id))
       .map(async (el) => {
         const { duration: maxDuration } = await resolveMediaDuration(
           el.src!,
@@ -791,7 +790,7 @@ async function parseSubCompositions(
   const results = await Promise.all(
     workItems.map(async (item) => {
       const { html: compiledSub } = await compileHtmlFile(
-        item.rawSubHtml,
+        rewriteUnresolvableGsapToCdn(item.rawSubHtml, projectDir, item.srcPath),
         dirname(item.filePath),
         downloadDir,
         undefined,
@@ -943,6 +942,12 @@ function coalesceHeadStylesAndBodyScripts(html: string): string {
   const body = document.querySelector("body");
   if (!head && !body) return html;
 
+  const liveStyles = [...document.querySelectorAll("style")].filter(isAlwaysAppliedStyle);
+  const dedupedStyles = dedupeFontFaceRules(liveStyles.map((el) => el.textContent || ""));
+  liveStyles.forEach((el, i) => {
+    el.textContent = dedupedStyles[i] ?? "";
+  });
+
   const styleEls = head ? Array.from(head.querySelectorAll("style")) : [];
   const importRe = /@import\s+url\([^)]*\)\s*;|@import\s+["'][^"']+["']\s*;/gi;
   for (const run of styleEls.length > 1 ? headStyleRuns(styleEls) : []) {
@@ -1054,7 +1059,9 @@ function inlineSubCompositions(
         let compHtml = subCompositions.get(srcPath) || null;
         if (!compHtml) {
           const read = readProjectFile(resolve(projectDir, srcPath));
-          if (read.kind === "file") compHtml = read.text;
+          if (read.kind === "file") {
+            compHtml = rewriteUnresolvableGsapToCdn(read.text, projectDir, srcPath);
+          }
         }
         return compHtml;
       },
@@ -1935,10 +1942,7 @@ export interface CompileForRenderOptions {
   allowSystemFontCapture?: boolean;
   /** Caller cancellation propagated through compile-time font fetches. */
   abortSignal?: AbortSignal;
-  /**
-   * Optional persistent cache directory for prep-time animated GIF → WebM
-   * transcodes. When omitted, the render's downloadDir is used.
-   */
+  /** Persistent cache directory for the animated GIF and HEIC prep transcodes; defaults to downloadDir. */
   animatedGifCacheDir?: string;
   /** FFmpeg timeout for animated GIF transcodes. */
   ffmpegProcessTimeout?: number;
@@ -1952,19 +1956,34 @@ export interface CompileForRenderOptions {
   pageMotionBlur?: "off";
 }
 
-const GSAP_CDN_BASE = gsapCdnDist();
+/** Renders follow the same `HYPERFRAMES_GSAP_BASE_URL` mirror as Studio preview. */
+function renderGsapDist(): string {
+  try {
+    return gsapCdnDist(undefined, normalizeGsapBaseUrl(process.env.HYPERFRAMES_GSAP_BASE_URL));
+  } catch (cause) {
+    throw new Error(
+      "Invalid HYPERFRAMES_GSAP_BASE_URL: use an absolute HTTPS npm mirror root (plain HTTP only for localhost) without credentials, query, or fragment",
+      { cause },
+    );
+  }
+}
 
-function rewriteUnresolvableGsapToCdn(html: string, projectDir: string): string {
+/** `compSrcPath` resolves a sub-composition's script the way the inliner will hoist it. */
+function rewriteUnresolvableGsapToCdn(
+  html: string,
+  projectDir: string,
+  compSrcPath?: string,
+): string {
+  let gsapDist: string | undefined;
+  const exists = (path: string) => existsSync(resolve(projectDir, path));
   return html.replace(
     /(<script\b[^>]*\bsrc=["'])([^"']*gsap[^"']*\/dist\/([^"']+))(["'][^>]*>)/gi,
     (full, prefix, src, file, suffix) => {
       if (/^https?:\/\//i.test(src)) return full;
-      const absPath = resolve(projectDir, src);
-      if (existsSync(absPath)) return full;
-      defaultLogger.info(
-        `[Compiler] Rewriting missing gsap script to CDN: ${src} → ${GSAP_CDN_BASE}${file}`,
-      );
-      return `${prefix}${GSAP_CDN_BASE}${file}${suffix}`;
+      if (exists(compSrcPath ? rewriteAssetPath(compSrcPath, src, exists) : src)) return full;
+      gsapDist ??= renderGsapDist();
+      defaultLogger.info(`[Compiler] Rewriting missing gsap script: ${src} → ${gsapDist}${file}`);
+      return `${prefix}${gsapDist}${file}${suffix}`;
     },
   );
 }
@@ -2074,7 +2093,6 @@ export async function compileForRender(
   // `transformPerspective`, so scanning post-inline HTML would flag every
   // composition that loads GSAP from a CDN.
   const usesThreeDTransforms = detectThreeDTransformUsage(sanitizedHtml);
-  const usesMixBlendMode = detectMixBlendModeUsage(sanitizedHtml);
   const hasAncestorBackgroundImage = detectAncestorBackgroundImage(sanitizedHtml);
 
   const normalizedFontHtml = normalizeSystemFontPrimaryFamilies(
@@ -2145,12 +2163,29 @@ export async function compileForRender(
   const { html: htmlWithLocalizedFonts, remoteMediaAssets: remoteFontAssets } =
     await localizeRemoteFontFaces(htmlWithLocalBg, downloadDir);
 
+  // Chrome cannot decode HEIC, and ffprobe reads a tiled one as video streams,
+  // so convert to JPEG before the media-type preflight sees it.
+  const {
+    html: htmlWithJpegs,
+    preparedAssets: preparedHeifAssets,
+    preparedImages: preparedHeifImages,
+  } = await prepareHeifImageInputs(htmlWithLocalizedFonts, {
+    projectDir,
+    downloadDir,
+    cacheDir: options.animatedGifCacheDir,
+    sourceAssets: remoteImageAssets,
+    timeoutMs: options.ffmpegProcessTimeout,
+  });
+  if (preparedHeifImages.length > 0) {
+    defaultLogger.info(`[Compiler] Converted ${preparedHeifImages.length} HEIC image(s) to JPEG`);
+  }
+
   const gifSourceAssets = new Map<string, string>(remoteImageAssets);
   const {
     html: htmlWithPreparedGifs,
     preparedAssets: preparedGifAssets,
     preparedGifs,
-  } = await prepareAnimatedGifInputs(htmlWithLocalizedFonts, {
+  } = await prepareAnimatedGifInputs(htmlWithJpegs, {
     projectDir,
     downloadDir,
     cacheDir: options.animatedGifCacheDir,
@@ -2183,6 +2218,9 @@ export async function compileForRender(
   for (const [relPath, absPath] of preparedGifAssets) {
     externalAssets.set(relPath, absPath);
   }
+  for (const [relPath, absPath] of preparedHeifAssets) {
+    externalAssets.set(relPath, absPath);
+  }
 
   // Read the media list off the inlined document rather than merging the
   // per-file lists. Merging deduplicated by element id, which is only unique
@@ -2208,7 +2246,7 @@ export async function compileForRender(
       if (analysis.isProblematic) {
         defaultLogger.warn(
           `[Compiler] WARNING: Video "${video.id}" has sparse keyframes (max interval: ${analysis.maxIntervalSeconds}s). ` +
-            `This causes seek failures and frame freezing. Re-encode with: ${reencode}`,
+            `Long GOPs can make preview seeking slower; rendering is unaffected. If preview seeking is slow, re-encode with: ${reencode}`,
         );
       }
       if (metadata.isVFR) {
@@ -2253,7 +2291,6 @@ export async function compileForRender(
     renderModeHints,
     hasShaderTransitions,
     usesThreeDTransforms,
-    usesMixBlendMode,
     hasAncestorBackgroundImage,
   };
 }
@@ -2276,6 +2313,7 @@ export interface BrowserMediaElement {
   /** True when compilation inferred duration from the fallback source. */
   durationInferred: boolean;
   mediaStart: number;
+  playbackRate: RateSpec;
   loop: boolean;
   hasAudio: boolean;
   volume: number;
@@ -2301,6 +2339,9 @@ export async function discoverMediaFromBrowser(page: Page): Promise<BrowserMedia
       durationInferred: boolean;
       playbackStartRaw: string | null;
       mediaStartRaw: string | null;
+      playbackRateRaw: string | null;
+      automationRaw: string | null;
+      defaultPlaybackRate: number;
       loop: boolean;
       hasAudio: boolean;
       volume: number;
@@ -2341,10 +2382,10 @@ export async function discoverMediaFromBrowser(page: Page): Promise<BrowserMedia
       if (!id) return;
 
       // currentSrc is authoritative for <video>/<audio><source> and responsive images.
-      const ownSrc = htmlEl.getAttribute("src");
-      const blankSrc =
-        ownSrc !== null && ownSrc.trim() === "" && !htmlEl.querySelector("source[src]");
-      const src = blankSrc ? "" : htmlEl.currentSrc || htmlEl.src || ownSrc || "";
+      const resolvedSrc = htmlEl.currentSrc || htmlEl.src || htmlEl.getAttribute("src") || "";
+      const withoutQueryAndHash = (url: string) => url.replace(/[?#][\s\S]*$/, "");
+      const isPageItself = withoutQueryAndHash(resolvedSrc) === withoutQueryAndHash(location.href);
+      const src = isPageItself ? "" : resolvedSrc;
       const start = parseFloat(htmlEl.getAttribute("data-start") || "0");
       const endRaw = htmlEl.getAttribute("data-end");
       const durationRaw = htmlEl.getAttribute("data-duration");
@@ -2354,6 +2395,12 @@ export async function discoverMediaFromBrowser(page: Page): Promise<BrowserMedia
         : (htmlEl as HTMLVideoElement | HTMLAudioElement).duration;
       const playbackStartRaw = htmlEl.getAttribute("data-playback-start");
       const mediaStartRaw = htmlEl.getAttribute("data-media-start");
+      const playbackRateRaw = htmlEl.getAttribute("data-playback-rate");
+      const automationRaw = htmlEl.getAttribute("data-automation");
+      // playbackRate can include the transport speed; defaultPlaybackRate is the clip's own rate.
+      const defaultPlaybackRate = isImage
+        ? 1
+        : (htmlEl as HTMLVideoElement | HTMLAudioElement).defaultPlaybackRate;
       const loop = htmlEl.hasAttribute("loop");
       const hasAudio = htmlEl.getAttribute("data-has-audio") === "true";
       const volume = parseFloat(htmlEl.getAttribute("data-volume") || "1");
@@ -2372,6 +2419,9 @@ export async function discoverMediaFromBrowser(page: Page): Promise<BrowserMedia
         durationInferred,
         playbackStartRaw,
         mediaStartRaw,
+        playbackRateRaw,
+        automationRaw,
+        defaultPlaybackRate,
         loop,
         hasAudio,
         volume,
@@ -2383,7 +2433,17 @@ export async function discoverMediaFromBrowser(page: Page): Promise<BrowserMedia
   });
 
   return elements.map(
-    ({ endRaw, durationRaw, intrinsicDuration, playbackStartRaw, mediaStartRaw, ...element }) => ({
+    ({
+      endRaw,
+      durationRaw,
+      intrinsicDuration,
+      playbackStartRaw,
+      mediaStartRaw,
+      playbackRateRaw,
+      automationRaw,
+      defaultPlaybackRate,
+      ...element
+    }) => ({
       ...element,
       end: parseStrictFiniteTimingNumber(endRaw) ?? 0,
       duration:
@@ -2397,6 +2457,13 @@ export async function discoverMediaFromBrowser(page: Page): Promise<BrowserMedia
           return null;
         },
       }),
+      playbackRate: resolveRateSpec(
+        automationRaw,
+        readPlaybackRate(
+          (name) => (name === "data-playback-rate" ? playbackRateRaw : null),
+          defaultPlaybackRate,
+        ),
+      ),
     }),
   );
 }

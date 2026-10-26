@@ -375,6 +375,9 @@ const SCOPED_HYPERFRAMES_EXPRESSION = `!__hfBaseHyperframes
         },
       })`;
 
+export const AUTHORED_SOURCE_BEGIN = "/*hf-authored-begin*/";
+export const AUTHORED_SOURCE_END = "/*hf-authored-end*/";
+
 export function scopedModulePrelude(
   timelineCompositionId: string,
   compositionSrc?: string | null,
@@ -404,6 +407,9 @@ export function wrapScopedCompositionScript(
   const rootSelectorPatternLiteral = jsonScriptLiteral(
     String.raw`\[\s*data-composition-id\s*=\s*(?:"${escapedCompositionId}"|'${escapedCompositionId}')\s*\]`,
   );
+  const timelineRootSelectorPatternLiteral = jsonScriptLiteral(
+    String.raw`\[\s*data-composition-id\s*=\s*(?:"${escapeRegExp(timelineCompositionId)}"|'${escapeRegExp(timelineCompositionId)}')\s*\]`,
+  );
   const timingSelectorPatternLiteral = jsonScriptLiteral(
     String.raw`\s*\[\s*data-(?:start|duration)\s*=\s*(?:"[^"]*"|'[^']*')\s*\]`,
   );
@@ -424,6 +430,7 @@ export function wrapScopedCompositionScript(
     : "");
   var __hfRoot = null;
   var __hfRootSelectorPattern = ${rootSelectorPatternLiteral};
+  var __hfTimelineRootSelectorPattern = ${timelineRootSelectorPatternLiteral};
   var __hfTimingSelectorPattern = ${timingSelectorPatternLiteral};
   var __hfAuthoredRootSelector = __hfAuthoredRootId
     ? "[" + __hfAuthoredRootAttr + '="' + __hfEscapeAttr(__hfAuthoredRootId) + '"]'
@@ -435,7 +442,11 @@ export function wrapScopedCompositionScript(
     if (!__hfCompId || typeof selector !== "string") return selector;
     var normalized = selector
       .replace(new RegExp(__hfRootSelectorPattern + '(?:' + __hfTimingSelectorPattern + ')+', 'g'), __hfRootSelector)
-      .replace(new RegExp('(?:' + __hfTimingSelectorPattern + ')+' + __hfRootSelectorPattern, 'g'), __hfRootSelector);
+      .replace(new RegExp('(?:' + __hfTimingSelectorPattern + ')+' + __hfRootSelectorPattern, 'g'), __hfRootSelector)
+      .replace(new RegExp(__hfRootSelectorPattern, 'g'), __hfRootSelector);
+    if (__hfTimelineCompId !== __hfCompId) {
+      normalized = normalized.replace(new RegExp(__hfTimelineRootSelectorPattern, 'g'), __hfRootSelector);
+    }
     return window.__hfSvgSelectorAliases.rewrite(normalized, __hfAuthoredRootEntries);
   };
   var __hfFindRoot = function() {
@@ -579,16 +590,22 @@ export function wrapScopedCompositionScript(
       })
     : window;
   var __hfResolveGsapTarget = function(target) {
-    if (typeof target === "string") return __hfQueryAll(target);
-    if (!Array.isArray(target)) return target;
-    return target.reduce(function(resolved, item) {
+    if (typeof target !== "string" && !Array.isArray(target)) return target;
+    var resolved = typeof target === "string" ? __hfQueryAll(target) : target.reduce(function(resolved, item) {
       if (typeof item === "string") {
         return resolved.concat(Array.prototype.slice.call(__hfQueryAll(item)));
       }
       resolved.push(item);
       return resolved;
     }, []);
-
+    if (!resolved.length) {
+      // GSAP warns "GSAP target " + targets + " not found"; a bare empty match list prints an
+      // empty name. Keep the authored selector as the text while still targeting nothing here.
+      var originalTarget = String(target);
+      resolved = [];
+      resolved.toString = function() { return originalTarget; };
+    }
+    return resolved;
   };
   var __hfScopeTimeline = function(timeline) {
     if (!timeline || timeline.__hfScopedCompositionRoot === __hfFindRoot()) return timeline;
@@ -671,7 +688,9 @@ export function wrapScopedCompositionScript(
     if (typeof report === "function") report("start", __hfCompositionSrc || "index.html");
     try {
       (function(document, gsap, window, __hyperframes) {
+${AUTHORED_SOURCE_BEGIN}
 ${source.replace(/<\/(script)/gi, "<\\/$1")}
+${AUTHORED_SOURCE_END}
       }).call(window, __hfScopedDocument, __hfScopedGsap, __hfScopedWindow, __hfScopedHyperframes);
     } catch (_err) {
       console.error(__hfErrorLabel, __hfCompId, _err);

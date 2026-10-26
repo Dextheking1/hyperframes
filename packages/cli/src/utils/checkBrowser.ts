@@ -1,5 +1,6 @@
 import type { CheckDeadline } from "./checkDeadline.js";
-import { BrowserCleanupError, closeManagedBrowser } from "../browser/launch.js";
+import { logCheckProgress } from "./checkProgress.js";
+import { BrowserCleanupError, closeManagedBrowser, onStopSignal } from "../browser/launch.js";
 import { collectMotionBlurDrafts, dropMotionBlurConsoleEcho } from "./checkMotionBlur.js";
 import { checkSnapshotDirectory } from "./checkSnapshotDirectory.js";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
@@ -30,9 +31,22 @@ import { loadBrowserScript } from "../commands/layout.js";
 import { normalizeErrorMessage } from "./errorMessage.js";
 import { ambiguousIssue, type MotionFrame } from "./motionAudit.js";
 import type { LayoutIssue, LayoutIssueCode, LayoutRect } from "./layoutAudit.js";
-import { serveStaticProjectHtml } from "./staticProjectServer.js";
+import { serveStaticProjectHtml, type StaticProjectServer } from "./staticProjectServer.js";
+import { prepareFindingInspector } from "./checkFindingInspect.js";
 import { collectTweenRecords, findTweenTails, tweenTailMessage } from "./gsapTweenTails.js";
+import {
+  measuredInMotion,
+  readContrastMotion,
+  type ContrastMotionSample,
+} from "./contrastMotion.js";
 import { resolveAutoProxy } from "./projectConfig.js";
+import { findStageProxyBox } from "./compositionViewport.js";
+import type { PreviewProxyBox } from "@hyperframes/core";
+import { injectTagsAtHeadStart } from "@hyperframes/core/compiler/html-document";
+import {
+  STUDIO_PREVIEW_CAPTURE_MODE,
+  STUDIO_PREVIEW_MARK_META,
+} from "@hyperframes/core/studio-preview-mark";
 import {
   decideMediaProxyEligibility,
   proxyVariantFor,
@@ -42,6 +56,7 @@ import {
   FfmpegUnavailableError,
   getProxyCachePath,
   resolveProxies,
+  type ProxyProgress,
 } from "@hyperframes/studio-server/proxy-transcoder";
 import { rectToBbox } from "./checkTypes.js";
 import type {
@@ -53,6 +68,9 @@ import type {
   CheckBrowserResult,
   CheckFinding,
   CheckFindingCropRequest,
+  CheckFindingFrameRequest,
+  CheckFindingFrames,
+  CheckFindingInspection,
   CheckGeometryCandidate,
   CheckOptions,
   CheckSeverity,
@@ -116,6 +134,7 @@ interface PreparedContrast {
   candidate: ContrastCandidate;
   knownBackdrop: boolean;
   anchor: CheckAnchor;
+  motion: ContrastMotionSample | null;
 }
 
 interface FinishedContrast {
@@ -126,6 +145,43 @@ interface FinishedContrast {
   large: boolean;
   fg: string;
   bg: string;
+}
+
+const COPY_HEARTBEAT_MS = 10_000;
+
+function elapsedText(ms: number): string {
+  const seconds = Math.round(ms / 1000);
+  return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+}
+
+/** Says on stderr how far each copy is, so a slow copy reads as slow and a stuck one as stuck. */
+function startCopyHeartbeat(
+  sources: ReadonlyArray<{ file: string }>,
+  cached: readonly boolean[],
+): {
+  progress: (index: number, progress: ProxyProgress) => void;
+  settled: (index: number) => void;
+  stop: () => void;
+} {
+  const startedAt = Date.now();
+  const latest = new Map<number, ProxyProgress>();
+  const timer = setInterval(() => {
+    for (const [index, { doneSeconds, totalSeconds }] of latest) {
+      if (cached[index]) continue;
+      const done = totalSeconds
+        ? `${Math.min(100, Math.floor((doneSeconds / totalSeconds) * 100))}%`
+        : "";
+      console.error(
+        `[hyperframes] browser-playable copy of ${sources[index]!.file}: ${done || `${Math.floor(doneSeconds)}s done`} (${elapsedText(Date.now() - startedAt)} so far)`,
+      );
+    }
+  }, COPY_HEARTBEAT_MS);
+  timer.unref();
+  return {
+    progress: (index, progress) => void latest.set(index, progress),
+    settled: (index) => void latest.delete(index),
+    stop: () => clearInterval(timer),
+  };
 }
 
 /**
@@ -145,7 +201,7 @@ export async function preResolveHostileMediaProxies(
   html: string,
   autoProxyOverride?: boolean,
 ): Promise<ProxyPreResolution> {
-  const none: ProxyPreResolution = { findings: [], failedPaths: new Set() };
+  const none: ProxyPreResolution = { findings: [], failedPaths: new Set(), files: [] };
   if (!resolveAutoProxy(projectDir, autoProxyOverride)) return none;
   let codecMap: Awaited<ReturnType<typeof scanProjectMediaCodecMap>>;
   try {
@@ -162,6 +218,7 @@ export async function preResolveHostileMediaProxies(
   if (hostileEntries.length === 0) return none;
 
   const startedAt = Date.now();
+  const stageBox = findStageProxyBox(html);
   const sources = hostileEntries.map(([pathname, facts]) => {
     const file = pathname.replace(/^\/+/, "");
     return {
@@ -169,19 +226,34 @@ export async function preResolveHostileMediaProxies(
       file,
       sourcePath: resolve(projectDir, file),
       variant: proxyVariantFor(facts),
+      box: stageBox,
     };
   });
   const total = hostileEntries.length;
-  const toMake = sources.filter((source) => !proxyCached(projectDir, source)).length;
+  const cached = sources.map((source) => proxyCached(projectDir, source));
+  const toMake = cached.filter((isCached) => !isCached).length;
   if (toMake > 0) {
     console.error(
       `[hyperframes] Making browser-playable copies of ${toMake} video${toMake === 1 ? "" : "s"} Chrome cannot decode. Only the first check of these files waits for this; later checks reuse the copies.`,
     );
   }
   let settled = 0;
-  const results = await resolveProxies(projectDir, sources, () => {
-    settled += 1;
-    if (toMake > 0) console.error(`[hyperframes] browser-playable copies: ${settled}/${total}`);
+  const heartbeat = startCopyHeartbeat(sources, cached);
+  const stopped = new AbortController();
+  const forgetStop = onStopSignal(() => stopped.abort());
+  const results = await resolveProxies(
+    projectDir,
+    sources,
+    (index) => {
+      settled += 1;
+      heartbeat.settled(index);
+      if (toMake > 0) console.error(`[hyperframes] browser-playable copies: ${settled}/${total}`);
+    },
+    heartbeat.progress,
+    stopped.signal,
+  ).finally(() => {
+    heartbeat.stop();
+    forgetStop();
   });
   const failures = sources.flatMap((source, index) => {
     const result = results[index]!;
@@ -205,28 +277,59 @@ export async function preResolveHostileMediaProxies(
       ),
     );
   }
-  return { findings, failedPaths: new Set(failures.map(({ pathname }) => pathname)) };
+  const files = sources.map(({ file }, index): PreparedMediaFile => {
+    const result = results[index]!;
+    if (result.status === "rejected") {
+      return { file, state: "failed", reason: normalizeErrorMessage(result.reason) };
+    }
+    return { file, state: cached[index] ? "cached" : "ready" };
+  });
+  return { findings, failedPaths: new Set(failures.map(({ pathname }) => pathname)), files };
 }
 
 function proxyCached(
   projectDir: string,
-  source: { sourcePath: string; variant: ReturnType<typeof proxyVariantFor> },
+  source: {
+    sourcePath: string;
+    variant: ReturnType<typeof proxyVariantFor>;
+    box?: PreviewProxyBox;
+  },
 ): boolean {
   try {
-    return existsSync(getProxyCachePath(projectDir, source.sourcePath, source.variant));
+    return existsSync(getProxyCachePath(projectDir, source.sourcePath, source.variant, source.box));
   } catch {
     return false;
   }
+}
+
+export interface PreparedMediaFile {
+  file: string;
+  state: "ready" | "cached" | "failed";
+  reason?: string;
 }
 
 interface ProxyPreResolution {
   findings: RuntimeDraft[];
   /** Root-relative paths of the videos whose copy failed. */
   failedPaths: Set<string>;
+  /** One entry per browser-hostile video, in project order. */
+  files: PreparedMediaFile[];
 }
 
 function proxyFailedDraft(message: string): RuntimeDraft {
   return { code: "media_proxy_failed", severity: "warning", message, time: 0 };
+}
+
+async function loadCheckHtmlWithDeferredMedia(dir: string): Promise<string> {
+  const { bundleWithLocalizedFonts } = await import("./bundleWithLocalizedFonts.js");
+  return withCapturePreviewMark(await bundleWithLocalizedFonts(dir));
+}
+
+function withCapturePreviewMark(html: string): string {
+  return injectTagsAtHeadStart(
+    html,
+    `<meta name="${STUDIO_PREVIEW_MARK_META}" content="${STUDIO_PREVIEW_CAPTURE_MODE}">`,
+  );
 }
 
 export async function runBrowserCheck(
@@ -237,8 +340,7 @@ export async function runBrowserCheck(
   deadline?: CheckDeadline,
   prelaunched?: PrelaunchedBrowser,
 ): Promise<CheckBrowserResult> {
-  const { bundleWithLocalizedFonts } = await import("./bundleWithLocalizedFonts.js");
-  const html = await bundleWithLocalizedFonts(project.dir);
+  const html = await loadCheckHtmlWithDeferredMedia(project.dir);
   deadline?.enter("copies");
   const { findings: drafts, failedPaths } = await preResolveHostileMediaProxies(
     project.dir,
@@ -288,6 +390,12 @@ export async function runBrowserCheck(
     await waitForPreferredSeekTarget(page);
 
     const rootAnchor = await resolveRootAnchor(page);
+    deadline?.keepPartial(() => ({
+      runtimeFindings: dropFailedProxyEchoes(
+        keepBrokenImageAborts(drafts, new Set()),
+        failedPaths,
+      ).map((draft) => runtimeFinding(draft, rootAnchor)),
+    }));
     const launchSettleMs = Date.now() - launchSettleStart;
     // validate's per-media-element audit, kept in the consolidation: a clip
     // whose intrinsic duration is meaningfully shorter than its data-duration
@@ -306,7 +414,15 @@ export async function runBrowserCheck(
     drafts.push(...blur);
     const sampleLog = sampleWindow(drafts);
     const driver = createPageDriver(page, clock, sampleLog);
-    const result = await runGrid(driver, options, motion, helpers, deadline?.enter);
+    const result = await runGrid(
+      driver,
+      options,
+      motion,
+      helpers,
+      deadline?.enter,
+      logCheckProgress,
+      deadline?.keepPartial,
+    );
     helperSession?.stop();
     const helper = await helperOpen?.catch(() => undefined);
     const merged = helper ? mergeHelperDrafts(sampleLog, helper.sampleLog) : drafts;
@@ -457,35 +573,8 @@ export async function captureFindingCrops(
   deadline?: CheckDeadline,
 ): Promise<string[]> {
   if (requests.length === 0) return [];
-  const { bundleWithLocalizedFonts } = await import("./bundleWithLocalizedFonts.js");
-  const html = await bundleWithLocalizedFonts(project.dir);
-  const server = await serveStaticProjectHtml(
-    project.dir,
-    html,
-    "Failed to bind check server",
-    [],
-    options.autoProxy,
-  );
-  let chromeBrowser: import("puppeteer-core").Browser | undefined;
-  const written: string[] = [];
-  let failure: { kind: "none" } | { kind: "failed"; error: unknown } = { kind: "none" };
-  try {
-    const session = await openSettledCompositionPage(html, server.url, {
-      navigationTimeoutMs: options.timeout,
-      renderReadyTimeoutMs: options.timeout,
-      renderReadyWarningSuffix: "capturing finding crops",
-      signal: deadline?.signal,
-      onBrowser: deadline?.ownBrowser,
-      onBrowserReady: deadline?.start,
-      beforeNavigate: (page) => deadline?.preparePage(page),
-      browserGpuMode: options.browserGpuMode ?? resolveCliChromeGpuMode(),
-    });
-    chromeBrowser = session.browser;
-    const page = session.page;
-    await waitForPreferredSeekTarget(page);
-
-    const snapshotDir = checkSnapshotDirectory(project.dir);
-    mkdirSync(snapshotDir, { recursive: true });
+  return withFindingCapturePage(project, options, deadline, "crops", async (page, snapshotDir) => {
+    const written: string[] = [];
     for (const request of requests) {
       await seekCompositionTimeline(page, request.time, SCREENSHOT_SEEK_OPTIONS);
       const canvas = await page.evaluate(() => ({
@@ -498,6 +587,89 @@ export async function captureFindingCrops(
       written.push(join(snapshotDir, request.filename));
     }
     return written;
+  });
+}
+
+export async function captureFindingFrames(
+  project: ProjectDir,
+  options: CheckOptions,
+  requests: CheckFindingFrameRequest[],
+  deadline?: CheckDeadline,
+): Promise<CheckFindingFrames> {
+  if (requests.length === 0) return { written: [], inspected: [] };
+  const inspector = requests.some((request) => request.inspect?.length)
+    ? await prepareFindingInspector(project.dir, async (bundleOptions) => {
+        const { bundleWithLocalizedFonts } = await import("./bundleWithLocalizedFonts.js");
+        return withCapturePreviewMark(
+          await bundleWithLocalizedFonts(project.dir, undefined, bundleOptions),
+        );
+      })
+    : undefined;
+  deadline?.signal.throwIfAborted();
+  return withFindingCapturePage(
+    project,
+    options,
+    deadline,
+    "frames",
+    async (page, snapshotDir, server) => {
+      await inspector?.ready(server);
+      deadline?.signal.throwIfAborted();
+      const written: string[] = [];
+      const inspected: CheckFindingInspection[] = [];
+      for (const request of requests) {
+        deadline?.enter("frames");
+        await seekCompositionTimeline(page, request.time, SCREENSHOT_SEEK_OPTIONS);
+        const buffer = await page.screenshot({ type: "png", optimizeForSpeed: true });
+        writeFileSync(join(snapshotDir, request.filename), buffer);
+        written.push(join(snapshotDir, request.filename));
+        if (!inspector) continue;
+        for (const target of request.inspect ?? []) {
+          deadline?.enter("frames");
+          const inspect = await inspector.inspect(page, target);
+          deadline?.signal.throwIfAborted();
+          inspected.push({ time: request.time, target, inspect });
+        }
+      }
+      return { written, inspected };
+    },
+    inspector?.html,
+  );
+}
+
+async function withFindingCapturePage<T>(
+  project: ProjectDir,
+  options: CheckOptions,
+  deadline: CheckDeadline | undefined,
+  what: "crops" | "frames",
+  capture: (page: Page, snapshotDir: string, server: StaticProjectServer) => Promise<T>,
+  pageHtml?: string,
+): Promise<T> {
+  const html = pageHtml ?? (await loadCheckHtmlWithDeferredMedia(project.dir));
+  const server = await serveStaticProjectHtml(
+    project.dir,
+    html,
+    "Failed to bind check server",
+    [],
+    options.autoProxy,
+  );
+  let chromeBrowser: import("puppeteer-core").Browser | undefined;
+  let failure: { kind: "none" } | { kind: "failed"; error: unknown } = { kind: "none" };
+  try {
+    const session = await openSettledCompositionPage(html, server.url, {
+      navigationTimeoutMs: options.timeout,
+      renderReadyTimeoutMs: options.timeout,
+      renderReadyWarningSuffix: `capturing finding ${what}`,
+      signal: deadline?.signal,
+      onBrowser: deadline?.ownBrowser,
+      onBrowserReady: deadline?.start,
+      beforeNavigate: (page) => deadline?.preparePage(page),
+      browserGpuMode: options.browserGpuMode ?? resolveCliChromeGpuMode(),
+    });
+    chromeBrowser = session.browser;
+    await waitForPreferredSeekTarget(session.page);
+    const snapshotDir = checkSnapshotDirectory(project.dir);
+    mkdirSync(snapshotDir, { recursive: true });
+    return await capture(session.page, snapshotDir, server);
   } catch (error) {
     failure = { kind: "failed", error };
     throw error;
@@ -739,12 +911,33 @@ function wireNetworkListeners(page: Page, drafts: RuntimeDraft[], clock: Runtime
   });
 }
 
+function failWhenPageDies(page: Page, driver: CheckAuditDriver): CheckAuditDriver {
+  const dead = new Promise<never>((_, reject) => {
+    page.on("error", (error) =>
+      reject(new Error(`The page crashed: ${normalizeErrorMessage(error)}`)),
+    );
+    page.on("close", () => reject(new Error("The page closed before the check finished")));
+  });
+  dead.catch(() => undefined);
+  return Object.fromEntries(
+    Object.entries(driver).map(([name, member]) => [
+      name,
+      typeof member === "function"
+        ? (...args: unknown[]) => {
+            const result: unknown = Reflect.apply(member, driver, args);
+            return result instanceof Promise ? Promise.race([result, dead]) : result;
+          }
+        : member,
+    ]),
+  ) as unknown as CheckAuditDriver;
+}
+
 export function createPageDriver(
   page: Page,
   clock: RuntimeClock = createRuntimeClock(),
   sampleLog?: SampleWindow,
 ): CheckAuditDriver {
-  return {
+  return failWhenPageDies(page, {
     initialize: (contrast) => injectAuditScripts(page, contrast),
     markSamples: (phase) => {
       if (!sampleLog) return;
@@ -797,10 +990,11 @@ export function createPageDriver(
     collectMotionFrame: (time, selectors, scopes) =>
       collectMotionFrame(page, time, selectors, scopes),
     anchorMotionIssues: (issues) => anchorLayoutIssues(page, issues),
-    collectContrast: (time, annotations) => collectContrast(page, time, annotations),
+    collectContrast: (time, annotations, skipInMotion) =>
+      collectContrast(page, time, annotations, skipInMotion),
     collectCraftFrame: (time) => collectCraftFrame(page, time),
     collectCraftFilm: () => collectCraftFilm(page),
-  };
+  });
 }
 
 async function collectCraftFrame(page: Page, time: number): Promise<CraftFrame> {
@@ -1382,10 +1576,13 @@ async function collectContrast(
   page: Page,
   time: number,
   snapshotAnnotations?: CheckAnnotationBox[],
+  skipInMotion = false,
 ): Promise<ContrastCapture> {
   let prepared: PreparedContrast[] = [];
   try {
-    prepared = parsePreparedContrast(await prepareContrast(page, time));
+    const candidates = await prepareContrast(page, time);
+    const motion = skipInMotion ? await page.evaluate(readContrastMotion).catch(() => []) : [];
+    prepared = parsePreparedContrast(candidates, motion);
     if (prepared.length === 0 && !snapshotAnnotations) return { entries: [] };
     // This screenshot is the one contrast math is sampled from below — it must
     // stay untouched by the annotation overlay (finishContrast reads real
@@ -1645,14 +1842,25 @@ async function finishContrast(
   );
 }
 
-function parsePreparedContrast(raw: unknown[]): PreparedContrast[] {
-  return raw.flatMap((value) => {
+function parsePreparedContrast(
+  raw: unknown[],
+  motion: (ContrastMotionSample | null)[],
+): PreparedContrast[] {
+  return raw.flatMap((value, index) => {
     if (!isRecord(value)) return [];
     const raw = Reflect.get(value, "candidate");
     const candidate = parseContrastCandidate(raw);
     const anchor = parseAnchor(Reflect.get(value, "anchor"));
     return candidate && anchor
-      ? [{ raw, candidate, anchor, knownBackdrop: knownBackdrop(raw) }]
+      ? [
+          {
+            raw,
+            candidate,
+            anchor,
+            knownBackdrop: knownBackdrop(raw),
+            motion: motion[index] ?? null,
+          },
+        ]
       : [];
   });
 }
@@ -1707,7 +1915,9 @@ function joinContrastEntries(
         candidate.candidate.selector === entry.selector && candidate.candidate.text === entry.text,
     );
     const match = index >= 0 ? remaining.splice(index, 1)[0] : undefined;
-    return match ? [{ ...entry, ...match.anchor }] : [];
+    if (!match) return [];
+    if (!entry.wcagAA && match.motion && measuredInMotion(match.motion)) return [];
+    return [{ ...entry, ...match.anchor }];
   });
 }
 

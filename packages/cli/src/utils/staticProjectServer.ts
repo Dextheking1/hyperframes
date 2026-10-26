@@ -1,9 +1,16 @@
 import { createServer, request as httpRequest, type Server, type ServerResponse } from "node:http";
 import { Duplex } from "node:stream";
-import { createReadStream, existsSync, statSync } from "node:fs";
+import { createReadStream, existsSync, readFileSync, statSync } from "node:fs";
+import { stripSdrPngColourTags } from "@hyperframes/core/compiler/png-colour-tags";
 import { isAbsolute, relative, resolve } from "node:path";
+import {
+  PREVIEW_PROXY_BOX_PARAM,
+  parsePreviewProxyBox,
+  type PreviewProxyBox,
+} from "@hyperframes/core";
 import { getMimeType } from "@hyperframes/core/studio-api";
 import { decodeWellFormedEscapes } from "@hyperframes/studio-server";
+import { findStageProxyBox } from "./compositionViewport.js";
 import { resolveAutoProxy } from "./projectConfig.js";
 import { injectMediaCodecMap } from "./compositionServer.js";
 import {
@@ -111,6 +118,15 @@ export function inProcessAnswer(url: string) {
   return inProcessAnswers.get(new URL(url).origin);
 }
 
+function serveUntaggedPng(filePath: string, res: ServerResponse): boolean {
+  if (getMimeType(filePath) !== "image/png") return false;
+  const untagged = stripSdrPngColourTags(readFileSync(filePath));
+  if (!untagged) return false;
+  res.writeHead(200, { "Content-Type": "image/png", "Content-Length": String(untagged.length) });
+  res.end(untagged);
+  return true;
+}
+
 /**
  * Serve a file with HTTP Range support. Chromium needs byte-range seekability
  * to determine the duration of formats that carry it in a trailing/implicit
@@ -165,6 +181,7 @@ function serveFileWithRange(
   // just `[start, end]` and closes its own fd on end/error. writeHead is
   // deferred to `open` so a failed open can still answer 500.
   const stream = createReadStream(filePath, { start, end });
+  res.once("close", () => stream.destroy());
   stream.on("open", () => {
     res.writeHead(status, headers);
     stream.pipe(res);
@@ -205,6 +222,7 @@ async function serveProxyRequest(
   projectDir: string,
   filePath: string,
   request: ProxyVariantRequest,
+  box: PreviewProxyBox | undefined,
   autoProxy: boolean,
   rangeHeader: string | undefined,
   res: ServerResponse,
@@ -236,7 +254,7 @@ async function serveProxyRequest(
       return;
     }
     recordProxyRequest();
-    const proxyPath = await resolveProxy(projectDir, filePath, variant, undefined, { signal });
+    const proxyPath = await resolveProxy(projectDir, filePath, variant, box, { signal });
     // The await above can span a whole transcode; the client may be gone.
     if (res.writableEnded || res.destroyed) return;
     serveFileWithRange(proxyPath, rangeHeader, res, PROXY_VARIANT_CONFIG[variant].contentType);
@@ -263,7 +281,15 @@ export async function serveStaticProjectHtml(
   const autoProxy = resolveAutoProxy(projectDir, autoProxyOverride);
   const copies = new AbortController();
   const servedHtml = autoProxy
-    ? await injectMediaCodecMap(html, projectDir, [{ html }], undefined, true, copies.signal)
+    ? await injectMediaCodecMap(
+        html,
+        projectDir,
+        [{ html }],
+        undefined,
+        true,
+        copies.signal,
+        findStageProxyBox(html),
+      )
     : html;
 
   // fallow-ignore-next-line complexity
@@ -277,10 +303,17 @@ export async function serveStaticProjectHtml(
 
     const queryIndex = url.indexOf("?");
     const pathOnly = queryIndex === -1 ? url : url.slice(0, queryIndex);
-    const proxyParam =
-      queryIndex === -1 ? null : new URLSearchParams(url.slice(queryIndex + 1)).get("hf-proxy");
+    const query = new URLSearchParams(queryIndex === -1 ? "" : url.slice(queryIndex + 1));
+    const proxyParam = query.get("hf-proxy");
     const proxyRequest =
       proxyParam !== null && isProxyVariantRequest(proxyParam) ? proxyParam : null;
+    const boxParam = query.get(PREVIEW_PROXY_BOX_PARAM);
+    const proxyBox = boxParam === null ? undefined : parsePreviewProxyBox(boxParam);
+    if (proxyBox === null || (proxyBox && !proxyRequest)) {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
 
     const requestPath = decodeWellFormedEscapes(pathOnly).replace(/^\//, "");
     for (const root of roots) {
@@ -293,13 +326,15 @@ export async function serveStaticProjectHtml(
             projectDir,
             filePath,
             proxyRequest,
+            proxyBox,
             autoProxy,
             req.headers.range,
             res,
             copies.signal,
           );
         } else {
-          serveFileWithRange(filePath, req.headers.range, res);
+          if (!serveUntaggedPng(filePath, res))
+            serveFileWithRange(filePath, req.headers.range, res);
         }
         return;
       }

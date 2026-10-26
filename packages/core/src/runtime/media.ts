@@ -1,5 +1,6 @@
 import { swallow } from "./diagnostics";
 import { isClipVisibleAt, isInClipWindow } from "./clipWindow";
+import { mediaElementTime } from "./mediaClock";
 import { sameInstant } from "../clipFacts";
 import { interpolateVolumeGain, type VolumeKeyframe } from "./mediaVolumeEnvelope.js";
 import { elementVolumeLaneGain } from "./audioAutomationVolume.js";
@@ -9,6 +10,7 @@ import { rateAt, sourceTimeAt, timeAtSourceTime, type RateSpec } from "../speedR
 import { clampAudioGain, clipGain, gainTimesLane } from "../audioGain.js";
 import { isMemberGroupHidden } from "../audioGroups.js";
 import { findInjectedRenderFrame } from "./renderFrameSibling.js";
+import { isRenderFrameVideo } from "./preloadMedia.js";
 import { registerSeekCompletion } from "./adapters/seek-dispatch.js";
 import { cutToHostSlots, type HostSlot } from "../mediaTiming.js";
 export {
@@ -266,6 +268,18 @@ export function hasMediaSyncStateForTest(el: HTMLMediaElement): boolean {
 export const MEDIA_HARD_SYNC_SECONDS = 0.5;
 export const VIDEO_PRESEEK_SECONDS = 1.5;
 
+export function mediaSourceTimeAt(clip: RuntimeMediaClip, timeSeconds: number): number {
+  const elapsed = Math.max(0, Math.min(timeSeconds, clip.end) - (clip.origin ?? clip.start));
+  const target = clip.mediaStart + sourceTimeAt(clip.rate ?? clip.playbackRate, elapsed);
+  if (clip.sourceDuration == null) return target;
+  const loopLength = clip.sourceDuration - clip.mediaStart;
+  if (clip.loop && loopLength > 0 && target >= clip.sourceDuration)
+    return clip.mediaStart + ((target - clip.mediaStart) % loopLength);
+  // A non-loop video past its source holds the last frame.
+  if (!clip.loop && clip.el.tagName === "VIDEO") return Math.min(target, clip.sourceDuration);
+  return target;
+}
+
 function prepareUpcomingVideo(
   clip: RuntimeMediaClip,
   time: number,
@@ -286,20 +300,12 @@ function prepareUpcomingVideo(
     ("__HF_EXPORT_RENDER_SEEK_CONFIG" in window && window.__HF_EXPORT_RENDER_SEEK_CONFIG)
   )
     return;
-  let target =
-    clip.mediaStart +
-    sourceTimeAt(clip.rate ?? clip.playbackRate, clip.start - (clip.origin ?? clip.start));
-  if (clip.sourceDuration != null) {
-    const loopLength = clip.sourceDuration - clip.mediaStart;
-    if (clip.loop && loopLength > 0 && target >= clip.sourceDuration)
-      target = clip.mediaStart + ((target - clip.mediaStart) % loopLength);
-    else if (!clip.loop) target = Math.min(target, clip.sourceDuration);
-  }
+  const target = mediaSourceTimeAt(clip, clip.start);
   if (!Number.isFinite(target) || target < 0 || Math.abs(el.currentTime - target) <= 0.001) return;
   try {
     // A trimmed video exposed during its in-point seek has no current frame at the cut.
     // Hidden preparation must not hold the visible-frame seek barrier.
-    el.currentTime = target;
+    el.currentTime = mediaElementTime(target);
   } catch (err) {
     swallow("runtime.media.preseek", err);
   }
@@ -314,6 +320,11 @@ const MIN_NATIVE_PLAYBACK_RATE = 1 / 16;
 // A playing video is steered back by rate, not seeked (a seek resets its decoder).
 // Its rate is written only when steering starts or stops: every write costs a frame.
 const VIDEO_STEER = 0.03;
+// A video that starts a cut late closes its lag over one clip at 3%; a bigger lag steers harder, in steps so the rate is written rarely.
+const VIDEO_STEER_STEPS: readonly (readonly [lag: number, steer: number])[] = [
+  [0.3, 0.25],
+  [0.1, 0.1],
+];
 const VIDEO_STEER_RELEASE_SECONDS = 0.01;
 
 /** Direction (+1 fast, -1 slow) a video is being steered in; absent when it plays at its authored rate. */
@@ -328,7 +339,9 @@ function steeredVideoRate(el: HTMLMediaElement, offset: number, baseRate: number
     videoSteering.delete(el);
     return baseRate;
   }
-  return baseRate * (1 + direction * VIDEO_STEER);
+  const lag = Math.abs(offset);
+  const steer = VIDEO_STEER_STEPS.find(([from]) => lag > from)?.[1] ?? VIDEO_STEER;
+  return baseRate * (1 + direction * steer);
 }
 
 // fallow-ignore-next-line complexity
@@ -364,6 +377,7 @@ export function syncRuntimeMedia(params: {
     effectiveVolume: number,
     authorVolume: number,
     clipGain: number,
+    unfadedVolume?: number,
   ) => void;
   /** Is THIS element owned by the Web Audio transport? Owned → mute it (transport
    *  plays it); not owned → leave audible (HTMLMedia fallback). Per-element, not a
@@ -406,15 +420,10 @@ export function syncRuntimeMedia(params: {
       !inWindow &&
       (params.timeSeconds >= clip.end || sameInstant(params.timeSeconds, clip.end)) &&
       isClipVisibleAt(params.timeSeconds, clip.start, clip.end, params.getCompositionDuration());
-    let relTime =
-      sourceTimeAt(clipRate, Math.max(0, Math.min(params.timeSeconds, clip.end) - origin)) +
-      clip.mediaStart;
+    const relTime = mediaSourceTimeAt(clip, params.timeSeconds);
     const isHeldVideoTail =
       isTerminalVideo ||
       (isNonLoopVideo && clip.sourceDuration != null && relTime >= clip.sourceDuration && inWindow);
-    if (isHeldVideoTail && clip.sourceDuration != null) {
-      relTime = Math.min(relTime, clip.sourceDuration);
-    }
     const previousRelativeTime = lastRelativeTime.get(el);
     const audioReenteredAfterBackwardSeek =
       el.tagName === "AUDIO" &&
@@ -437,13 +446,6 @@ export function syncRuntimeMedia(params: {
       (!el.ended || clip.loop || isHeldVideoTail || canSeekEndedMediaBackward);
     if (isActive) {
       lastRelativeTime.set(el, relTime);
-      // Loop wrapping: when media reaches end, restart from mediaStart
-      if (clip.loop && clip.sourceDuration != null && clip.sourceDuration > 0) {
-        const loopLength = clip.sourceDuration - clip.mediaStart;
-        if (loopLength > 0 && relTime >= clip.sourceDuration) {
-          relTime = clip.mediaStart + ((relTime - clip.mediaStart) % loopLength);
-        }
-      }
       const userVol = clampVolume(params.userVolume ?? 1);
       const fallbackAuthorVolume = clampAudioGain(clip.volume ?? 1);
       const previousRuntimeVolume = lastRuntimeAppliedVolume.get(el);
@@ -507,6 +509,7 @@ export function syncRuntimeMedia(params: {
       }
 
       // Clip-local fade on top of the resolved level, matching render's afade-after-volume.
+      const unfadedVolume = authorVolume;
       const fades = clip.fades ?? NO_FADES;
       if (fades.fadeIn > 0 || fades.fadeOut > 0) {
         authorVolume *= fadeGain(
@@ -529,7 +532,9 @@ export function syncRuntimeMedia(params: {
       const effectiveVolume = silencedByHidden ? 0 : clampVolume(authorVolume * userVol);
       if (Math.abs(el.volume - effectiveVolume) > 1e-6) el.volume = effectiveVolume;
       lastRuntimeAppliedVolume.set(el, effectiveVolume);
-      params.onElementVolume?.(el, effectiveVolume, authorVolume, preFxGain);
+      if (unfadedVolume === authorVolume)
+        params.onElementVolume?.(el, effectiveVolume, authorVolume, preFxGain);
+      else params.onElementVolume?.(el, effectiveVolume, authorVolume, preFxGain, unfadedVolume);
       // Mute only when force-muted or the transport owns this element; an unclaimed
       // track stays audible via the HTMLMedia fallback.
       if ((forceMuteAll || params.isWebAudioOwned?.(el)) && !el.muted) el.muted = true;
@@ -539,7 +544,7 @@ export function syncRuntimeMedia(params: {
       // past the buffered range. Setting this on every tick is cheap
       // (no-op when already "auto") and catches elements whose preload
       // was overridden after init.ts set it.
-      if (el.preload !== "auto") el.preload = "auto";
+      if (el.preload !== "auto" && !isRenderFrameVideo(el)) el.preload = "auto";
       // Per-element rate × global transport rate
       const baseRate = rateAt(clipRate, params.timeSeconds - origin) * params.playbackRate;
       // Too slow for the browser to play: kept paused and stepped onto the playhead by seeks.
@@ -643,7 +648,7 @@ export function syncRuntimeMedia(params: {
         const skipForInjectedVideo = el.tagName === "VIDEO" && !!findInjectedRenderFrame(el);
         if (!skipForInjectedVideo) {
           try {
-            el.currentTime = relTime;
+            el.currentTime = mediaElementTime(relTime);
           } catch (err) {
             swallow("runtime.media.site2", err);
           }
@@ -651,7 +656,7 @@ export function syncRuntimeMedia(params: {
             seekLoadRetried.add(el);
             el.load();
             try {
-              el.currentTime = relTime;
+              el.currentTime = mediaElementTime(relTime);
             } catch (err) {
               swallow("runtime.media.site3", err);
             }

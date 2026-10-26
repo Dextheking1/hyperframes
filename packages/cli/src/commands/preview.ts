@@ -80,6 +80,7 @@ import {
   type PreviewLifecycleSession,
 } from "./previewLifecycleOutput.js";
 import { resolveLocalBrowserGpuMode, type BrowserGpuMode } from "../browser/gpuPolicy.js";
+import { parsePort } from "../utils/port.js";
 
 interface BrowserLaunchOptions {
   noOpen?: boolean;
@@ -316,7 +317,9 @@ export default defineCommand({
       try {
         const project = args.json ? resolveProjectOrThrow(args.dir) : resolveProject(args.dir);
         if (args.stop) {
-          const stopped = await stopBackgroundPreview(project.dir, startPort);
+          const stopped = await stopBackgroundPreview(project.dir, startPort, {
+            preferredPort: explicitPort,
+          });
           if (args.json) {
             writeLifecycleJson(
               lifecyclePayload(
@@ -335,7 +338,9 @@ export default defineCommand({
           }
           return;
         }
-        const status = await readBackgroundPreviewStatus(project.dir, startPort);
+        const status = await readBackgroundPreviewStatus(project.dir, startPort, {
+          preferredPort: explicitPort,
+        });
         if (!status) {
           if (args.json) {
             writeLifecycleJson(
@@ -355,7 +360,7 @@ export default defineCommand({
               "status",
               previewLifecycleSession({
                 state: "running",
-                mode: "background",
+                mode: status.logPath ? "background" : "unknown",
                 projectName: project.name,
                 projectDir: project.dir,
                 port: status.port,
@@ -367,7 +372,10 @@ export default defineCommand({
           return;
         }
         printStudioSummary(project.name, previewBaseUrl(status.port), project.dir, {
-          details: [`Background preview running (PID ${status.pid}).`, `Log: ${status.logPath}`],
+          details: [
+            `${status.logPath ? "Background preview" : "Preview"} running${status.pid === null ? "" : ` (PID ${status.pid})`}.`,
+            ...(status.logPath ? [`Log: ${status.logPath}`] : []),
+          ],
         });
         return;
       } catch (error) {
@@ -686,10 +694,12 @@ export function previewLaunchModeError(options: {
 }
 
 export function previewPortError(port: string | undefined): string | null {
-  const value = port ?? "3002";
-  if (!/^\d+$/.test(value)) return "--port must be an integer between 1 and 65535";
-  const parsed = Number(value);
-  return parsed >= 1 && parsed <= 65535 ? null : "--port must be an integer between 1 and 65535";
+  try {
+    parsePort(port ?? "3002");
+    return null;
+  } catch (error) {
+    return errorMessage(error);
+  }
 }
 
 export function publicPreviewPid(
@@ -728,17 +738,27 @@ export async function handlePreviewList(
       (dependencies.scan ?? scanActiveServers)(startPort),
       (dependencies.listManaged ?? listBackgroundPreviewStatuses)(),
     ]);
+    const listedSessions = managedSessions.filter(
+      (session) =>
+        session.pid !== null ||
+        !scannedServers.some(
+          (server) =>
+            publicPreviewPid(server.pid, null) !== null &&
+            server.port === session.port &&
+            resolve(server.projectDir) === resolve(session.projectDir),
+        ),
+    );
     const managedKeys = new Set(
-      managedSessions.map((session) => `${resolve(session.projectDir)}\0${session.port}`),
+      listedSessions.map((session) => `${resolve(session.projectDir)}\0${session.port}`),
     );
     const servers = [
-      ...managedSessions.map((session) => ({
+      ...listedSessions.map((session) => ({
         port: session.port,
         host: "127.0.0.1",
         projectName: basename(session.projectDir),
         projectDir: session.projectDir,
-        version: "managed",
-        pid: String(session.pid),
+        version: session.logPath ? "managed" : "unknown",
+        pid: session.pid === null ? null : String(session.pid),
       })),
       ...scannedServers.filter(
         (server) => !managedKeys.has(`${resolve(server.projectDir)}\0${server.port}`),

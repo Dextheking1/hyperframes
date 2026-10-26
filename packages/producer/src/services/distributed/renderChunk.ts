@@ -36,6 +36,7 @@
 
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { cpus } from "node:os";
 import { join } from "node:path";
 import {
   assertSwiftShader,
@@ -60,8 +61,20 @@ import {
   type ShownBox,
 } from "@hyperframes/engine";
 import { defaultLogger } from "../../logger.js";
-import { applyRenderWarningPolicy, collectVideoMetadataHints } from "../renderOrchestrator.js";
-import { runEncodeStage } from "../render/stages/encodeStage.js";
+import {
+  applyRenderWarningPolicy,
+  collectVideoMetadataHints,
+  frameStallRule,
+} from "../renderOrchestrator.js";
+import { RenderObservabilityRecorder, observeRenderStage } from "../render/observability.js";
+import {
+  canEncodeWhileCapturing,
+  encodeWhileCapturing,
+  runEncodeStage,
+  type EncodeStageInput,
+  type EncodeWhileCapturing,
+} from "../render/stages/encodeStage.js";
+import { frameCacheOptions } from "../render/frameCacheBudget.js";
 import { runCaptureStage } from "../render/stages/captureStage.js";
 import { createCapturePlan } from "../render/capturePlan.js";
 import {
@@ -87,6 +100,7 @@ import {
   type PlanVideosJson,
   readFfmpegVersion,
 } from "./shared.js";
+import { effectiveChunkFrames } from "./chunkWeights.js";
 import { chunkAudioSource, chunksWithSubRange, muxChunkWithAudio } from "./chunkAudio.js";
 import { DISTRIBUTED_RENDER_CAPABILITIES, readPlanProtocolV1 } from "./planProtocol.js";
 import { readValidatedPlanV2Materialization } from "./planV2.js";
@@ -212,6 +226,11 @@ export interface RenderChunkOptions {
    * this many, one browser per 20 frames; never lowers it.
    */
   maxCaptureWorkers?: number;
+  interleaveCapture?: boolean;
+}
+
+export function interleavesCapture(overlapping: boolean, options?: RenderChunkOptions): boolean {
+  return overlapping && options?.interleaveCapture === true;
 }
 
 /** A browser starts in about 3 s, a small share of 20 frames' capture. */
@@ -307,6 +326,26 @@ export async function createVerifiedDistributedCaptureSession(
 
 function isCaptureMode(value: string): value is CaptureMode {
   return value === "beginframe" || value === "screenshot" || value === "drawelement";
+}
+
+/** Workers of one chunk launched in different modes: one worker's BeginFrame check failed and it fell back alone. */
+export class MixedCaptureModesError extends Error {
+  constructor(readonly modes: readonly string[]) {
+    super(`[renderChunk] capture workers reported inconsistent modes: ${modes.join(",")}`);
+    this.name = "MixedCaptureModesError";
+  }
+}
+
+export function observedChunkCaptureMode(
+  perfs: readonly Pick<CapturePerfSummary, "captureMode">[],
+): CaptureMode {
+  const modes = [...new Set(perfs.map((perf) => perf.captureMode))];
+  if (modes.length > 1) throw new MixedCaptureModesError(modes);
+  const [mode] = modes;
+  if (!mode || !isCaptureMode(mode)) {
+    throw new Error(`[renderChunk] capture workers reported an invalid mode: ${mode ?? "<none>"}`);
+  }
+  return mode;
 }
 
 /**
@@ -702,9 +741,10 @@ export async function renderChunk(
     // `PlanJson` doesn't carry the compiled hints needed to call it
     // directly. The existing adaptive-retry path reduces workers if
     // compositor contention surfaces as CDP timeouts.
+    const captureFrames = effectiveChunkFrames(framesInChunk, slice.captureCost);
     const chunkWorkerCount = resolveChunkCaptureWorkers(
-      framesInChunk,
-      calculateOptimalWorkers(framesInChunk, undefined, cfg),
+      captureFrames,
+      calculateOptimalWorkers(captureFrames, undefined, cfg),
       options?.maxCaptureWorkers,
     );
 
@@ -716,6 +756,7 @@ export async function renderChunk(
     // (boot, warmup, hash, IO) vs frame-proportional work. Consumed from the
     // perf sidecar / ChunkResult by the orchestration's telemetry.
     let sessionBootMs = 0;
+    let videoExtractMs = 0;
     let captureStageMs = 0;
     let encodeStageMs = 0;
     let captureMode: CaptureMode | undefined;
@@ -724,6 +765,8 @@ export async function renderChunk(
     let forceScreenshotForChunk = encoder.forceScreenshot;
     let shownBoxes: Map<string, ShownBox> | undefined;
     let extraction: Promise<unknown> | undefined;
+    // Frames go to the encoder as they land; it is started again if the capture is retried.
+    const overlap: { current: EncodeWhileCapturing | null } = { current: null };
     try {
       if (chunkWorkerCount === 1 || !forceScreenshotForChunk) {
         // Sequential capture reuses this session. Parallel BeginFrame capture
@@ -801,6 +844,7 @@ export async function renderChunk(
       // its own injector hook because the hook remembers the last injected frame
       // per video; sharing that state across a fresh retry page can suppress the
       // first injection and produce a blank/stale frame.
+      const extractStarted = Date.now();
       const deferredVideoFrames = planVideos
         ? extractDeferredVideoFramesForChunk({
             planDir,
@@ -811,6 +855,9 @@ export async function renderChunk(
             cfg,
             remoteSources,
             shownBoxes,
+          }).then((frames) => {
+            videoExtractMs = Date.now() - extractStarted;
+            return frames;
           })
         : Promise.resolve([]);
       extraction = deferredVideoFrames;
@@ -833,8 +880,74 @@ export async function renderChunk(
           : null;
       // A capture can fail before any session reads it; the failure is rethrown below.
       videoFrameLookup?.catch(() => {});
-      const createChunkVideoFrameInjector = createChunkVideoFrameInjectorFactory(videoFrameLookup);
+      const createChunkVideoFrameInjector = createChunkVideoFrameInjectorFactory(
+        videoFrameLookup,
+        frameCacheOptions(cfg, chunkWorkerCount),
+      );
 
+      const isPngSequence = plan.dimensions.format === "png-sequence";
+      outputKind = isPngSequence ? "frame-dir" : "file";
+      // mp4 / mov / webm use the standard preset machinery; locked encoder values come from the plan's
+      // encoder metadata. png-sequence has no encoder, but `runEncodeStage` still reads `preset.quality`,
+      // so fall back to the mp4 preset shape, as `renderOrchestrator` does.
+      const presetFormat: "mp4" | "mov" | "webm" = isPngSequence
+        ? "mp4"
+        : (plan.dimensions.format as "mp4" | "mov" | "webm");
+      const basePreset = getEncoderPreset(job.config.quality, presetFormat, undefined);
+      const preset = resolvePresetForLockedEncoder(basePreset, encoder.encoder);
+      const effectiveQuality = encoder.crf ?? preset.quality;
+      const effectiveBitrate = encoder.crf != null ? undefined : encoder.bitrate;
+      // For non-pngseq, encodeStage writes to `outputPath` when `isPngSequence`
+      // is false. `videoOnlyPath` is the encoder's direct output: assemble muxes
+      // the audio, or a chunk that carries audio muxes its own below.
+      const videoOnlyPath = encoder.chunksCarryAudio
+        ? `${outputChunkPath}.video.mp4`
+        : outputChunkPath;
+      if (isPngSequence) {
+        if (!existsSync(outputChunkPath)) mkdirSync(outputChunkPath, { recursive: true });
+      } else {
+        const outDir = join(outputChunkPath, "..");
+        if (!existsSync(outDir)) mkdirSync(outDir, { recursive: true });
+      }
+
+      const encodeInput: EncodeStageInput = {
+        job,
+        log,
+        outputPath: videoOnlyPath,
+        framesDir,
+        videoOnlyPath,
+        width: Math.round(plan.dimensions.width * encoder.deviceScaleFactor),
+        height: Math.round(plan.dimensions.height * encoder.deviceScaleFactor),
+        needsAlpha: plan.dimensions.format !== "mp4",
+        captureImageFormat: captureOptions.format ?? "jpeg",
+        // The encoder writes video only; audio joins at assemble time or in the
+        // chunk that carries audio. Suppressing `hasAudio` skips the png-sequence audio
+        // sidecar AND the mp4 audio mux.
+        hasAudio: false,
+        isPngSequence,
+        // `DistributedFormat` has no "gif" member — distributed chunks are
+        // always video segments (gif renders in-process only).
+        isGif: false,
+        preset,
+        effectiveQuality,
+        effectiveBitrate,
+        engineConfig: {
+          ffmpegEncodeTimeout: cfg.ffmpegEncodeTimeout,
+          vp9CpuUsed: resolveLockedVp9CpuUsed(encoder) ?? cfg.vp9CpuUsed,
+        },
+        // Distributed chunks emit a single ffmpeg call per chunk; the
+        // in-process per-chunk-within-chunk path would re-split our
+        // already-chunked work.
+        enableChunkedEncode: false,
+        chunkedEncodeSize: framesInChunk,
+        abortSignal: undefined,
+        assertNotAborted: () => {},
+        // GOP === framesInChunk + force-keyframe at frame 0 → the chunk's
+        // first frame is an IDR keyframe and concat-copy at assemble time
+        // round-trips losslessly.
+        lockGopForChunkConcat: !isPngSequence,
+        gopSize: framesInChunk,
+      };
       const captureStarted = Date.now();
       captureMode = await runCaptureWithScreenshotFallback({
         forceScreenshot: forceScreenshotForChunk,
@@ -873,39 +986,45 @@ export async function renderChunk(
           // including error paths. Clear our defensive handle before await.
           const captureSession = session;
           session = null;
-          await runCaptureStage({
-            fileServer,
-            workDir,
-            framesDir,
-            job,
-            totalFrames: framesInChunk,
-            cfg: captureCfg,
-            plan: capturePlan,
-            log,
-            probeSession: captureSession,
-            captureAttempts,
-            // This sink records each worker's effective capture mode so a
-            // fallback remains observable to adapters and smoke tests.
-            dedupPerfs: capturePerfs,
-            buildCaptureOptions: () => captureOptions,
-            createRenderVideoFrameInjector: createChunkVideoFrameInjector,
-            abortSignal: undefined,
-            assertNotAborted: () => {},
-            frameRange: range,
+          overlap.current = canEncodeWhileCapturing(encodeInput, chunkWorkerCount, cpus().length)
+            ? encodeWhileCapturing(encodeInput, framesInChunk)
+            : null;
+          await observeRenderStage(
+            new RenderObservabilityRecorder({ pipelineStartMs: start, log }),
+            "capture_chunk",
+            { chunkIndex },
+            (openAttempt) =>
+              runCaptureStage({
+                fileServer,
+                workDir,
+                framesDir,
+                job,
+                totalFrames: framesInChunk,
+                cfg: captureCfg,
+                plan: capturePlan,
+                log,
+                probeSession: captureSession,
+                captureAttempts,
+                // This sink records each worker's effective capture mode so a
+                // fallback remains observable to adapters and smoke tests.
+                dedupPerfs: capturePerfs,
+                buildCaptureOptions: () => captureOptions,
+                createRenderVideoFrameInjector: createChunkVideoFrameInjector,
+                abortSignal: undefined,
+                assertNotAborted: () => {},
+                frameRange: range,
+                onFrameLanded: (frame) => overlap.current?.onFrameLanded(frame),
+                interleaveFrames: interleavesCapture(overlap.current !== null, options),
+                openAttempt,
+              }),
+            { stall: frameStallRule(job) },
+          ).catch(async (captureError: unknown) => {
+            await overlap.current?.abort();
+            overlap.current = null;
+            throw captureError;
           });
 
-          const observedModes = new Set(capturePerfs.map((perf) => perf.captureMode));
-          if (observedModes.size !== 1 || ![...observedModes].every(isCaptureMode)) {
-            throw new Error(
-              `[renderChunk] capture workers reported invalid or inconsistent modes: ` +
-                `${[...observedModes].join(",") || "<none>"}`,
-            );
-          }
-          const [observedMode] = observedModes;
-          if (!observedMode || !isCaptureMode(observedMode)) {
-            throw new Error("[renderChunk] capture completed without an observed mode");
-          }
-          return observedMode;
+          return observedChunkCaptureMode(capturePerfs);
         },
         resetForScreenshotRetry: () => {
           // A mode switch is a whole-chunk retry. Do not allow successfully
@@ -940,74 +1059,10 @@ export async function renderChunk(
       framesEncoded = framesInChunk;
 
       // ── Encode the chunk ──
-      const isPngSequence = plan.dimensions.format === "png-sequence";
-      outputKind = isPngSequence ? "frame-dir" : "file";
-      // For mp4 / mov / webm we use the standard preset machinery; the
-      // locked encoder values come from `meta/encoder.json` and the
-      // `lockGopForChunkConcat` toggle is the only Phase-2 flag that flips
-      // on at this site. png-sequence has no encoder, but `runEncodeStage`
-      // still reads `preset.quality` for bookkeeping (it never reaches
-      // ffmpeg on the pngseq branch). Fall back to the mp4 preset shape —
-      // same trick `renderOrchestrator` plays.
-      const presetFormat: "mp4" | "mov" | "webm" = isPngSequence
-        ? "mp4"
-        : (plan.dimensions.format as "mp4" | "mov" | "webm");
-      const basePreset = getEncoderPreset(job.config.quality, presetFormat, undefined);
-      const preset = resolvePresetForLockedEncoder(basePreset, encoder.encoder);
-      const effectiveQuality = encoder.crf ?? preset.quality;
-      const effectiveBitrate = encoder.crf != null ? undefined : encoder.bitrate;
-      // For non-pngseq, encodeStage writes to `outputPath` when `isPngSequence`
-      // is false. `videoOnlyPath` is the encoder's direct output: assemble muxes
-      // the audio, or a chunk that carries audio muxes its own below.
-      const videoOnlyPath = encoder.chunksCarryAudio
-        ? `${outputChunkPath}.video.mp4`
-        : outputChunkPath;
-      if (isPngSequence) {
-        if (!existsSync(outputChunkPath)) mkdirSync(outputChunkPath, { recursive: true });
-      } else {
-        const outDir = join(outputChunkPath, "..");
-        if (!existsSync(outDir)) mkdirSync(outDir, { recursive: true });
-      }
-
       const encodeStarted = Date.now();
-      await runEncodeStage({
-        job,
-        log,
-        outputPath: videoOnlyPath,
-        framesDir,
-        videoOnlyPath,
-        width: Math.round(plan.dimensions.width * encoder.deviceScaleFactor),
-        height: Math.round(plan.dimensions.height * encoder.deviceScaleFactor),
-        needsAlpha: plan.dimensions.format !== "mp4",
-        captureImageFormat: captureOptions.format ?? "jpeg",
-        // The encoder writes video only; audio joins at assemble time or in the
-        // chunk that carries audio. Suppressing `hasAudio` skips the png-sequence audio
-        // sidecar AND the mp4 audio mux.
-        hasAudio: false,
-        isPngSequence,
-        // `DistributedFormat` has no "gif" member — distributed chunks are
-        // always video segments (gif renders in-process only).
-        isGif: false,
-        preset,
-        effectiveQuality,
-        effectiveBitrate,
-        engineConfig: {
-          ffmpegEncodeTimeout: cfg.ffmpegEncodeTimeout,
-          vp9CpuUsed: resolveLockedVp9CpuUsed(encoder) ?? cfg.vp9CpuUsed,
-        },
-        // Distributed chunks emit a single ffmpeg call per chunk; the
-        // in-process per-chunk-within-chunk path would re-split our
-        // already-chunked work.
-        enableChunkedEncode: false,
-        chunkedEncodeSize: framesInChunk,
-        abortSignal: undefined,
-        assertNotAborted: () => {},
-        // GOP === framesInChunk + force-keyframe at frame 0 → the chunk's
-        // first frame is an IDR keyframe and concat-copy at assemble time
-        // round-trips losslessly.
-        lockGopForChunkConcat: !isPngSequence,
-        gopSize: framesInChunk,
-      });
+      const overlapped = overlap.current;
+      overlap.current = null;
+      await (overlapped ? overlapped.finish() : runEncodeStage(encodeInput));
       if (encoder.chunksCarryAudio) {
         const audioScratchPath = `${outputChunkPath}.audio.m4a`;
         // A sub-range muxes the packets it owns as if it were a chunk of its own.
@@ -1029,6 +1084,7 @@ export async function renderChunk(
       encodeStageMs = Date.now() - encodeStarted;
     } finally {
       // No ffmpeg left writing into a work dir the caller removes; its error surfaced above.
+      await overlap.current?.abort().catch(() => {});
       await extraction?.catch(() => {});
       // Cleanest path: captureStage closed the session for us. The defensive
       // close handles error paths where we threw before delegating.
@@ -1064,6 +1120,8 @@ export async function renderChunk(
       sessionBootMs,
       captureStageMs,
       encodeStageMs,
+      // Wall time of the chunk's own video frame extraction; it overlaps captureStageMs, so do not add them.
+      videoExtractMs,
       workers: chunkWorkerCount,
       captureMode,
       // Device-pixel box each video's frames were extracted to cover; a video not listed kept full size.

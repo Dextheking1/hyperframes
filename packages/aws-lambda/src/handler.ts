@@ -121,6 +121,11 @@ export interface HandlerDeps {
  * shape; unwrap until we hit a discriminated event.
  */
 export async function handler(event: LambdaEvent, deps?: HandlerDeps): Promise<LambdaResult> {
+  if ((event as { Action?: unknown }).Action === "warm") {
+    primeRuntimeEnv();
+    await ensureChromePath(deps);
+    return { Action: "warm" };
+  }
   const unwrapped = unwrapEvent(event);
   validatePlanProtocolShape(unwrapped);
   validateEventS3Uris(unwrapped);
@@ -642,6 +647,7 @@ async function handleRenderChunk(
 
     const result: ChunkResult = await primitive(planDir, event.ChunkIndex, chunkOutputBase, {
       maxCaptureWorkers: lambdaMaxCaptureWorkers(),
+      interleaveCapture: true,
     });
     logEvent({
       event: "chunk_capture",
@@ -698,6 +704,7 @@ async function handleRenderChunkV2(
     );
     const result = await primitive(planDir, event.ChunkIndex, chunkOutputBase, {
       maxCaptureWorkers: lambdaMaxCaptureWorkers(),
+      interleaveCapture: true,
     });
     logEvent({
       event: "chunk_capture",

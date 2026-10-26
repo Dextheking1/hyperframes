@@ -1,11 +1,24 @@
-import { BrowserCleanupError } from "../browser/launch.js";
-import { CheckDeadline, CheckDeadlineError, type CheckPhase } from "./checkDeadline.js";
+import { BrowserCleanupError, onStopSignal } from "../browser/launch.js";
+import type { CheckProgress } from "./checkProgress.js";
+import {
+  CheckDeadline,
+  CheckDeadlineError,
+  CheckStoppedError,
+  type CheckPhase,
+} from "./checkDeadline.js";
 import {
   checkSnapshotDirectory,
   beginCheckSnapshots,
   finishCheckSnapshots,
 } from "./checkSnapshotDirectory.js";
-import { findingElementKey, groupSampledFindings } from "./checkFindings.js";
+import { findingAtRoot, findingElementKey, groupSampledFindings } from "./checkFindings.js";
+import {
+  MAX_FINDING_FRAME_TIMES,
+  selectFindingFrames,
+  withFindingFrameFields,
+  findingFrameRequests,
+} from "./checkFindingFrames.js";
+export { selectFindingFrames } from "./checkFindingFrames.js";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import type { PrelaunchedBrowser } from "../capture/captureCompositionFrame.js";
@@ -39,6 +52,7 @@ import {
 import { findMotionSpec, readMotionSpec, type MotionAssertion } from "./motionSpec.js";
 import { auditCraft } from "./craftAudit.js";
 import { inspectHdrAutoPromotion } from "./hdrPromotion.js";
+import { collectProjectMedia, type ProjectMedia } from "./projectMedia.js";
 import { normalizeErrorMessage } from "./errorMessage.js";
 import {
   parseColorRGBA,
@@ -57,12 +71,13 @@ import type {
   CheckDependencies,
   CheckFinding,
   CheckFindingCropRequest,
+  CheckFindingFrameRequest,
+  CheckFindingFrames,
   CheckGeometryCandidate,
   CheckOptions,
   CheckReport,
   CheckScreenshot,
   CheckSection,
-  CheckSeverity,
   ContrastAuditEntry,
   CraftFinding,
   CraftFrame,
@@ -83,6 +98,7 @@ export type {
   CheckDependencies,
   CheckFinding,
   CheckFindingCropRequest,
+  CheckFindingFrameRequest,
   CheckOptions,
   CheckReport,
   CheckSection,
@@ -515,6 +531,8 @@ async function collectGridSamples(
   motion: MotionPlan,
   helpers: Promise<CheckAuditDriver[]>,
   enter: (phase: CheckPhase) => void,
+  report: CheckProgress,
+  keep: (read: () => Partial<CheckBrowserResult>) => void,
 ): Promise<GridSamples> {
   const geometryEnabled = grid.captionSamples.length > 0 || grid.frameSamples.length > 0;
   const sets: SampleSets = {
@@ -526,11 +544,25 @@ async function collectGridSamples(
   const times = mergeSampleTimes(grid.layoutSamples, motion.times);
   const pending = times.map((_, index) => index);
   const perTime: GridSamples[] = [];
+  keep(() => {
+    const so = emptyGridSamples();
+    for (const samples of perTime) if (samples) appendGridSamples(so, samples);
+    const contrast = buildContrastResults(so.contrastEntries);
+    return {
+      layoutIssues: so.layoutIssues,
+      contrastFindings: contrast.findings,
+      contrastChecked: so.contrastEntries.length,
+      contrastPassed: contrast.passed,
+    };
+  });
+  let finished = 0;
   const work = async (worker: CheckAuditDriver, taken: number[] = []) => {
     for (let index = pending.shift(); index !== undefined; index = pending.shift()) {
       taken.push(index);
       const time = times[index] ?? 0;
       perTime[index] = await collectSampleAt(worker, options, grid, motion, sets, time);
+      enter("samples");
+      report("samples", ++finished, times.length);
     }
   };
   const helpWith = async (helper: CheckAuditDriver) => {
@@ -567,6 +599,8 @@ async function collectGridSamples(
     collected,
     options.range,
     craftEnabled(driver, options),
+    () => enter("overlap"),
+    report,
   );
   enter("samples");
   return collected;
@@ -584,9 +618,12 @@ async function collectContrastAt(
   collected: GridSamples,
 ): Promise<void> {
   const contrastStart = Date.now();
-  const capture = options.snapshots
-    ? await driver.collectContrast(time, annotationBoxesFrom(issuesAtTime))
-    : await driver.collectContrast(time);
+  const annotations = options.snapshots ? annotationBoxesFrom(issuesAtTime) : undefined;
+  const capture = options.skipContrastInMotion
+    ? await driver.collectContrast(time, annotations, true)
+    : options.snapshots
+      ? await driver.collectContrast(time, annotations)
+      : await driver.collectContrast(time);
   collected.contrastMs += Date.now() - contrastStart;
   collected.contrastEntries.push(...capture.entries);
   if (capture.pngBase64) collected.screenshots.push({ time, pngBase64: capture.pngBase64 });
@@ -598,6 +635,7 @@ const OVERLAP_SAMPLE_FPS = 8;
 const OVERLAP_MAX_SAMPLES = 240;
 // Part of it re-looks at an overlap half a second on where the grid is too sparse to show it held.
 const OVERLAP_HOLD_PROBES = 60;
+const OVERLAP_BATCH = 8;
 
 function evenlyPicked(times: number[], count: number): number[] {
   if (times.length <= count) return times;
@@ -676,32 +714,54 @@ async function denseOverlapTimes(
 }
 
 /** Reruns content_overlap on a fine grid, unconditionally rather than gated on fingerprint change, since an animation aliased to the sparse grid collides between identical-fingerprint samples. */
+async function collectOverlapGridInBatches(
+  driver: CheckAuditDriver,
+  times: number[],
+  progress: () => void,
+  report: CheckProgress,
+): Promise<AnchoredLayoutIssue[][]> {
+  const issues: AnchoredLayoutIssue[][] = [];
+  const batches = Math.ceil(times.length / OVERLAP_BATCH);
+  for (let from = 0; from < times.length; from += OVERLAP_BATCH) {
+    issues.push(...(await driver.collectOverlapGrid(times.slice(from, from + OVERLAP_BATCH))));
+    progress();
+    report("overlap", from / OVERLAP_BATCH + 1, batches);
+  }
+  return issues;
+}
+
 async function collectMotionOverlapSamples(
   driver: CheckAuditDriver,
   grid: SampleGrid,
   collected: GridSamples,
   range: [number, number] | undefined,
   craft: boolean,
+  progress: () => void,
+  report: CheckProgress,
 ): Promise<void> {
   const baseTimes = new Set(grid.layoutSamples);
   const shiftedTimes = await denseOverlapTimes(driver, grid, range);
   // Before the grid: a seek after it would overwrite the span the grid stamps on what its samples queue.
   if (craft) {
-    for (const time of buildCraftSampleTimes(grid.duration)) {
-      // The render's last frame lands before the duration, where the runtime has already unmounted clips.
-      if (time >= grid.duration) continue;
+    // The render's last frame lands before the duration, where the runtime has already unmounted clips.
+    const craftTimes = buildCraftSampleTimes(grid.duration).filter((time) => time < grid.duration);
+    for (const [index, time] of craftTimes.entries()) {
       await driver.seekGeometry(time);
       collected.craftFrames.push(...(await collectCraftFrame(driver, time)));
+      progress();
+      report("craft", index + 1, craftTimes.length);
     }
   }
   const probeHold = holdProber(driver, collected, range ? range[1] : grid.duration);
-  const gridIssues = await driver.collectOverlapGrid(shiftedTimes.filter((t) => !baseTimes.has(t)));
+  const gridTimes = shiftedTimes.filter((t) => !baseTimes.has(t));
+  const gridIssues = await collectOverlapGridInBatches(driver, gridTimes, progress, report);
   let sample = 0;
   for (const [index, time] of shiftedTimes.entries()) {
     if (baseTimes.has(time)) continue;
     const issues = gridIssues[sample++] ?? [];
     collected.layoutIssues.push(...issues);
     await probeHold(time, shiftedTimes[index + 1] ?? Number.POSITIVE_INFINITY, issues);
+    progress();
   }
 }
 
@@ -1435,6 +1495,8 @@ export async function runAuditGrid(
   motion: MotionSpecResolution,
   helpers: Promise<CheckAuditDriver[]> = Promise.resolve([]),
   enter: (phase: CheckPhase) => void = () => {},
+  report: CheckProgress = () => {},
+  keep: (read: () => Partial<CheckBrowserResult>) => void = () => {},
 ): Promise<CheckBrowserResult> {
   enter("samples");
   await driver.initialize(options.contrast);
@@ -1445,7 +1507,16 @@ export async function runAuditGrid(
     grid.duration,
   );
   const seekLoopStart = Date.now();
-  const collected = await collectGridSamples(driver, options, grid, plan, helpers, enter);
+  const collected = await collectGridSamples(
+    driver,
+    options,
+    grid,
+    plan,
+    helpers,
+    enter,
+    report,
+    keep,
+  );
   const seekLoopMs = Date.now() - seekLoopStart;
 
   let motionIssues = plan.preflightIssues;
@@ -1566,15 +1637,7 @@ export async function runCheckPipeline(
     });
 
     const lint = buildLintSection(lintResult);
-    let hdrPromotion: CheckReport["hdr"]["autoPromotion"] = null;
-    let hdrInspection: CheckReport["hdr"]["inspection"] = "available";
-    try {
-      hdrPromotion = await (dependencies.inspectHdrAutoPromotion ?? inspectHdrAutoPromotion)(
-        project,
-      );
-    } catch {
-      hdrInspection = "unavailable";
-    }
+    const { hdr, audio } = await inspectProjectMedia(project, dependencies);
     if (shouldBlockRender(true, false, lintResult.totalErrors, lintResult.totalWarnings)) {
       return buildReport(
         options,
@@ -1583,8 +1646,9 @@ export async function runCheckPipeline(
         { kind: "none" },
         [],
         [],
-        hdrPromotion,
-        hdrInspection,
+        hdr.autoPromotion,
+        hdr.inspection,
+        await audio,
       );
     }
 
@@ -1602,6 +1666,7 @@ export async function runCheckPipeline(
         : [];
 
     const deadline = new CheckDeadline();
+    const forgetStop = onStopSignal(deadline.stop);
     let outcome: { kind: "report"; report: CheckReport } | { kind: "failed"; error: unknown };
     try {
       let browser: CheckBrowserResult;
@@ -1611,8 +1676,9 @@ export async function runCheckPipeline(
           dependencies.runBrowserCheck(project, options, motion, deadline, browserAhead),
         );
       } catch (error) {
-        browser = emptyBrowserResult();
-        browser.runtimeFindings.push(runtimeFailure(error));
+        const found = deadline.partialResult();
+        browser = { ...emptyBrowserResult(), ...found, skipped: Object.keys(found).length === 0 };
+        browser.runtimeFindings = [...browser.runtimeFindings, runtimeFailure(error)];
       }
 
       const snapshotFiles = options.snapshots
@@ -1625,18 +1691,26 @@ export async function runCheckPipeline(
         motion,
         specFindings,
         snapshotFiles,
-        hdrPromotion,
-        hdrInspection,
+        hdr.autoPromotion,
+        hdr.inspection,
+        await audio,
       );
       outcome = {
         kind: "report",
-        report: options.snapshots
-          ? await withFindingCrops(dependencies, project, options, report, deadline)
-          : report,
+        report: await withOptionalFindingFrames(
+          dependencies,
+          project,
+          options,
+          options.snapshots
+            ? await withFindingCrops(dependencies, project, options, report, deadline)
+            : report,
+          deadline,
+        ),
       };
     } catch (error) {
       outcome = { kind: "failed", error };
     }
+    forgetStop();
     try {
       await deadline.close();
     } catch (error) {
@@ -1712,6 +1786,38 @@ async function withFindingCrops(
     // (a second Chrome launch failing/timing out) without failing the run.
     console.error("   finding crops skipped: " + normalizeErrorMessage(error));
     trackCommandFailure("check-finding-crops", error);
+    return report;
+  }
+}
+
+async function withOptionalFindingFrames(
+  dependencies: CheckDependencies,
+  project: ProjectDir,
+  options: CheckOptions,
+  report: CheckReport,
+  deadline: CheckDeadline,
+): Promise<CheckReport> {
+  if (!options.findingFrames || deadline.signal.aborted) return report;
+  const plan = selectFindingFrames(report);
+  if (plan.requests.length === 0) return report;
+  if (plan.skipped > 0) {
+    console.error(
+      `   finding frames: ${plan.skipped} finding(s) left out past ${MAX_FINDING_FRAME_TIMES} distinct times`,
+    );
+  }
+  const capture = dependencies.captureFindingFrames ?? captureFindingFrames;
+  try {
+    deadline.enter("frames");
+    const requests = findingFrameRequests(report, plan, options.inspect);
+    const captured = await deadline.run(() => capture(project, options, requests, deadline));
+    return withFindingFrameFields(report, plan, captured);
+  } catch (error) {
+    if (error instanceof CheckDeadlineError || error instanceof CheckStoppedError) {
+      const finding = runtimeFailure(error);
+      return { ...report, ok: false, runtime: section([...report.runtime.findings, finding]) };
+    }
+    console.error("   finding frames skipped: " + normalizeErrorMessage(error));
+    trackCommandFailure("check-finding-frames", error);
     return report;
   }
 }
@@ -1854,6 +1960,7 @@ function buildReport(
   snapshotFiles: string[],
   hdrPromotion: CheckReport["hdr"]["autoPromotion"] = null,
   hdrInspection: CheckReport["hdr"]["inspection"] = "available",
+  audioFindings: CheckFinding[] = [],
 ): CheckReport {
   const shaping = options.components?.length
     ? { ...options, maxIssues: Number.MAX_SAFE_INTEGER }
@@ -1865,8 +1972,10 @@ function buildReport(
   const motionSection = section(motionFindings);
   const contrastSection = section(browser.contrastFindings);
   const craftSection = section<CraftFinding>(browser.craft.findings);
+  const audioSection = section(audioFindings);
   const warningCount =
     lint.warningCount +
+    audioSection.warningCount +
     runtime.warningCount +
     layout.warningCount +
     motionSection.warningCount +
@@ -1874,6 +1983,7 @@ function buildReport(
     craftSection.warningCount;
   const errorCount =
     lint.errorCount +
+    audioSection.errorCount +
     runtime.errorCount +
     layout.errorCount +
     motionSection.errorCount +
@@ -1907,6 +2017,7 @@ function buildReport(
       step: browser.craft.step,
       samples: browser.craft.samples,
     },
+    audio: audioSection,
     hdr: { autoPromotion: hdrPromotion, inspection: hdrInspection },
     snapshots: {
       enabled: options.snapshots,
@@ -1952,7 +2063,7 @@ function filterComponentReport(report: CheckReport, options: CheckOptions): Chec
       components: options.components,
       hiddenFindings: 0,
       notes: [
-        "Static lint and unscoped runtime failures remain project-wide.",
+        "Static lint, audio and unscoped runtime failures remain project-wide.",
         ...(options.range
           ? [
               "Whole-timeline motion assertions, frozen-sweep detection and craft warnings are skipped for range checks.",
@@ -2074,24 +2185,6 @@ function runtimeFailure(error: unknown, code = "check_runtime_failure"): CheckFi
   );
 }
 
-function findingAtRoot(
-  code: string,
-  severity: CheckSeverity,
-  message: string,
-  sourceFile: string,
-): CheckFinding {
-  return {
-    code,
-    severity,
-    message,
-    selector: "[data-composition-id]",
-    dataAttributes: {},
-    sourceFile,
-    bbox: ZERO_BBOX,
-    time: 0,
-  };
-}
-
 function failureReport(options: CheckOptions, finding: CheckFinding): CheckReport {
   const lint = { ...section([]), filesScanned: 0 };
   const browser = emptyBrowserResult();
@@ -2173,6 +2266,16 @@ async function writeSnapshot(
   return relative(projectDir, path);
 }
 
+async function captureFindingFrames(
+  project: ProjectDir,
+  options: CheckOptions,
+  requests: CheckFindingFrameRequest[],
+  deadline?: CheckDeadline,
+): Promise<CheckFindingFrames> {
+  const module = await import("./checkBrowser.js");
+  return module.captureFindingFrames(project, options, requests, deadline);
+}
+
 async function captureFindingCrops(
   project: ProjectDir,
   options: CheckOptions,
@@ -2184,6 +2287,48 @@ async function captureFindingCrops(
   return module.captureFindingCrops(project, options, requests, deadline);
 }
 
+/** HDR promotion before the browser starts; audio findings later, overlapping the browser pass. */
+async function inspectProjectMedia(
+  project: ProjectDir,
+  dependencies: CheckDependencies,
+): Promise<{ hdr: CheckReport["hdr"]; audio: Promise<CheckFinding[]> }> {
+  const media = (dependencies.collectMedia ?? collectMedia)(project);
+  let hdr: CheckReport["hdr"];
+  try {
+    const promotion = (dependencies.inspectHdrAutoPromotion ?? inspectHdrAutoPromotion)(
+      project,
+      await media,
+    );
+    hdr = { autoPromotion: await promotion, inspection: "available" };
+  } catch {
+    hdr = { autoPromotion: null, inspection: "unavailable" };
+  }
+  const audio = media
+    .then((found) => (dependencies.inspectAudio ?? inspectAudio)(project, found))
+    .catch((error: unknown) => audioCheckFailure(project, error));
+  return { hdr, audio };
+}
+
+function collectMedia(project: ProjectDir): Promise<ProjectMedia> {
+  return collectProjectMedia(project.dir);
+}
+
+async function inspectAudio(project: ProjectDir, media: ProjectMedia): Promise<CheckFinding[]> {
+  const module = await import("./checkAudio.js");
+  return module.inspectAudio(project.dir, relative(project.dir, project.indexPath), media);
+}
+
+function audioCheckFailure(project: ProjectDir, error: unknown): CheckFinding[] {
+  return [
+    findingAtRoot(
+      "audio_check_unavailable",
+      "info",
+      `Audio was not checked: ${normalizeErrorMessage(error)}`,
+      relative(project.dir, project.indexPath),
+    ),
+  ];
+}
+
 const DEFAULT_DEPENDENCIES: CheckDependencies = {
   lintProject,
   resolveMotionSpec,
@@ -2191,5 +2336,8 @@ const DEFAULT_DEPENDENCIES: CheckDependencies = {
   prelaunchBrowser,
   writeSnapshot,
   captureFindingCrops,
+  captureFindingFrames,
+  collectMedia,
   inspectHdrAutoPromotion,
+  inspectAudio,
 };

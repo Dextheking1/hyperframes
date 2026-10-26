@@ -1,6 +1,7 @@
 import type { Hono } from "hono";
 import { parseHTML } from "linkedom";
 import { createReadStream, existsSync, readFileSync, statSync } from "node:fs";
+import { stripSdrPngColourTags } from "@hyperframes/core/compiler/png-colour-tags";
 import { Readable } from "node:stream";
 import { join, resolve } from "node:path";
 import { createHash } from "node:crypto";
@@ -14,11 +15,24 @@ import {
   type BundleOptions,
 } from "@hyperframes/core/compiler";
 import {
+  STUDIO_PREVIEW_CAPTURE_MODE,
   STUDIO_PREVIEW_MARK_META,
   STUDIO_PREVIEW_ERRORS,
 } from "@hyperframes/core/studio-preview-mark";
-import { PREVIEW_PROXY_BOX_PARAM, parsePreviewProxyBox } from "@hyperframes/core";
-import { gsapCdnDist, motionPathPluginUrl } from "@hyperframes/core/gsap-cdn";
+import {
+  PREVIEW_PROXY_BOX_PARAM,
+  PREVIEW_PROXY_LIGHT_PARAM,
+  PREVIEW_PROXY_PROGRESS_HEADER,
+  PREVIEW_PROXY_RETRY_PARAM,
+  parsePreviewProxyBox,
+} from "@hyperframes/core";
+import {
+  GSAP_BASE_URL_META,
+  gsapCdnDist,
+  motionPathPluginUrl,
+  normalizeGsapBaseUrl,
+  normalizeGsapLocalRoot,
+} from "@hyperframes/core/gsap-cdn";
 import { findStartTags, injectTagsAtHeadStart } from "@hyperframes/core/compiler/html-document";
 import { isWithinProjectRoot } from "@hyperframes/parsers/asset-resolution";
 import type { ResolvedProject, StudioApiAdapter } from "../types.js";
@@ -29,6 +43,11 @@ import {
 } from "../helpers/safePath.js";
 import { getMimeType } from "../helpers/mime.js";
 import { buildSubCompositionHtml, hasBaseElement } from "../helpers/subComposition.js";
+import {
+  htmlHasGsapCore,
+  insertGsapCoreBeforeHeadPlugin,
+  isGsapCoreUrl,
+} from "../helpers/gsapCoreScript.js";
 import {
   createProjectSignature,
   resolveProjectAndSignature,
@@ -48,7 +67,9 @@ import {
 import { isVariablesPayload, VARIABLES_PAYLOAD_ERROR } from "../helpers/variablesPayload.js";
 import { injectPreviewVariables } from "../helpers/previewVariables.js";
 import {
+  proxyCopyProgress,
   resolveProxy,
+  retryProxyCopy,
   waitForProxy,
   ProxyCapacityError,
   ProxyTranscodeError,
@@ -75,9 +96,13 @@ import { requestSubPath } from "../helpers/requestSubPath.js";
 import { lazyPreviewImages } from "../helpers/lazyPreviewImages.js";
 
 const PROJECT_SIGNATURE_META = "hyperframes-project-signature";
-const GSAP_CDN_SCRIPT = `<script src="${gsapCdnDist()}gsap.min.js"></script>`;
-const GSAP_CUSTOM_EASE_CDN_SCRIPT = `<script src="${gsapCdnDist()}CustomEase.min.js"></script>`;
-const GSAP_MOTION_PATH_CDN_SCRIPT = `<script src="${motionPathPluginUrl()}"></script>`;
+function escapeGsapUrl(url: string): string {
+  return url.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+}
+
+function gsapScriptTag(file: string, baseUrl: string): string {
+  return `<script src="${escapeGsapUrl(gsapCdnDist(undefined, baseUrl) + file)}"></script>`;
+}
 
 function injectProjectSignature(html: string, signature: string): string {
   const tag = `<meta name="${PROJECT_SIGNATURE_META}" content="${signature}">`;
@@ -128,18 +153,6 @@ function injectScriptTagIntoHead(html: string, scriptTag: string): string {
   return insertBeforeCloseTag(html, "head", `${scriptTag}\n`) ?? `${scriptTag}\n${html}`;
 }
 
-function htmlHasGsap(html: string): boolean {
-  // Only match GSAP references outside <template> elements — scripts inside
-  // templates are inert when cloned and don't make GSAP globally available.
-  const outsideTemplates = html.replace(/<template\b[^>]*>[\s\S]*?<\/template>/gi, "");
-  return (
-    /<script\b[^>]*src=["'][^"']*gsap/i.test(outsideTemplates) ||
-    /\/\*\s*inlined:.*gsap/i.test(outsideTemplates) ||
-    /\b(GreenSock|_gsScope)\b/.test(outsideTemplates) ||
-    /\bgsap\.(config|defaults|registerPlugin|version)\b/.test(outsideTemplates)
-  );
-}
-
 function htmlHasCustomEase(html: string): boolean {
   return (
     /<script\b[^>]*src=["'][^"']*CustomEase/i.test(html) ||
@@ -165,7 +178,7 @@ function htmlHasMotionPathPlugin(html: string): boolean {
   );
 }
 
-function injectMotionPathPluginIfNeeded(html: string): string {
+function injectMotionPathPluginIfNeeded(html: string, baseUrl: string): string {
   if (!htmlUsesMotionPath(html) || htmlHasMotionPathPlugin(html)) return html;
   // The plugin registers onto an already-loaded gsap, so it must come AFTER the
   // core gsap script — which often lives at body-end, not <head>. Insert it
@@ -175,15 +188,10 @@ function injectMotionPathPluginIfNeeded(html: string): string {
   if (gsap) {
     const version = gsap.src.match(/gsap@([\d.]+)/)?.[1];
     const ordering = `${gsap.type ? ` type="${gsap.type}"` : ""}${gsap.defer ? " defer" : ""}`;
-    const pluginTag = `<script${ordering} src="${motionPathPluginUrl(version)}"></script>`;
+    const pluginTag = `<script${ordering} src="${escapeGsapUrl(motionPathPluginUrl(version, baseUrl))}"></script>`;
     return html.slice(0, gsap.end) + "\n" + pluginTag + html.slice(gsap.end);
   }
-  return injectScriptTagIntoHead(html, GSAP_MOTION_PATH_CDN_SCRIPT);
-}
-
-function isGsapCoreUrl(src: string): boolean {
-  const base = "http://localhost/";
-  return URL.canParse(src, base) && /\/gsap(\.min)?\.js$/i.test(new URL(src, base).pathname);
+  return injectScriptTagIntoHead(html, gsapScriptTag("MotionPathPlugin.min.js", baseUrl));
 }
 
 type GsapCoreScript = { src: string; type: string | null; defer: boolean; end: number };
@@ -220,36 +228,45 @@ function scriptCloseEnd(html: string, start: number): number {
   return closeAt === undefined ? 0 : html.indexOf(">", closeAt) + 1;
 }
 
-function injectStudioMotionDependencies(html: string, manifestContent: string): string {
+function injectStudioMotionDependencies(
+  html: string,
+  manifestContent: string,
+  baseUrl: string,
+): string {
   const manifest = parseStudioMotionManifestContent(manifestContent);
   if (!manifest.hasMotion) return html;
   let next = html;
-  if (!htmlHasGsap(next)) next = injectScriptTagIntoHead(next, GSAP_CDN_SCRIPT);
+  if (!htmlHasGsapCore(next)) {
+    const core = gsapScriptTag("gsap.min.js", baseUrl);
+    next = insertGsapCoreBeforeHeadPlugin(next, core) ?? injectScriptTagIntoHead(next, core);
+  }
   if (manifest.hasCustomEase && !htmlHasCustomEase(next)) {
-    next = injectScriptTagIntoHead(next, GSAP_CUSTOM_EASE_CDN_SCRIPT);
+    next = injectScriptTagIntoHead(next, gsapScriptTag("CustomEase.min.js", baseUrl));
   }
   return next;
 }
 
-function injectStudioMotionScript(
-  html: string,
+function readStudioMotion(
   projectDir: string,
   activeCompositionPath: string,
-): string {
+): { manifestContent: string; script: string } | null {
   const manifestContent = readStudioMotionManifestContent(projectDir);
   const script = createStudioMotionRenderBodyScript(manifestContent, {
     activeCompositionPath,
   });
-  if (!script) return html;
-  const withDependencies = injectStudioMotionDependencies(html, manifestContent);
+  return script ? { manifestContent, script } : null;
+}
+
+function injectStudioMotionScript(html: string, script: string): string {
   const tag = `<script type="${AFTER_FONTS_SCRIPT_TYPE}">${script.replace(/<\/script/gi, "<\\/script")}</script>`;
-  return insertBeforeCloseTag(withDependencies, "body", tag) ?? `${withDependencies}${tag}`;
+  return insertBeforeCloseTag(html, "body", tag) ?? `${html}${tag}`;
 }
 
 const GSAP_FALLBACK_ATTR = "data-hf-gsap-fallback";
-const GSAP_CDN_FALLBACK_SCRIPT = `<script ${GSAP_FALLBACK_ATTR}>
+function gsapCdnFallbackScript(baseUrl: string): string {
+  return `<script ${GSAP_FALLBACK_ATTR}>
 (function(){
-  var cdnBase="${gsapCdnDist()}";
+  var cdnBase=${JSON.stringify(gsapCdnDist(undefined, baseUrl)).replace(/</g, "\\u003c")};
   var loaded={};
   function loadFallback(file){
     if(loaded[file])return loaded[file];
@@ -269,11 +286,13 @@ const GSAP_CDN_FALLBACK_SCRIPT = `<script ${GSAP_FALLBACK_ATTR}>
   },true);
 })();
 </script>`;
+}
 
-function injectGsapCdnFallback(html: string): string {
+function injectGsapCdnFallback(html: string, baseUrl: string): string {
   if (html.includes(GSAP_FALLBACK_ATTR)) return html;
-  if (html.includes("<head>")) return html.replace("<head>", "<head>" + GSAP_CDN_FALLBACK_SCRIPT);
-  return GSAP_CDN_FALLBACK_SCRIPT + html;
+  if (html.includes("<head>"))
+    return html.replace("<head>", "<head>" + gsapCdnFallbackScript(baseUrl));
+  return gsapCdnFallbackScript(baseUrl) + html;
 }
 
 /**
@@ -320,7 +339,7 @@ function previewVariablesFromRequest(rawVariables: string | undefined):
   return { raw: rawVariables, values: parse.values };
 }
 
-/** Captures screenshot right after a seek, so they get every image eager and no preview mark. */
+/** Captures screenshot right after a seek, so they get every image eager; media loads near the playhead. */
 export const PREVIEW_CAPTURE_PARAM = "hf-capture";
 
 // Studio's console capture attaches at the iframe's load; this keeps what was raised before it.
@@ -332,23 +351,38 @@ function injectStudioPreviewAugmentations(
   adapter: StudioApiAdapter,
   projectDir: string,
   activeCompositionPath: string,
-  capture: boolean,
+  options: { capture: boolean; gsapBaseUrl: string },
 ): string {
-  const marked = capture
-    ? html
+  const marked = options.capture
+    ? injectTagsAtHeadStart(
+        html,
+        `<meta name="${STUDIO_PREVIEW_MARK_META}" content="${STUDIO_PREVIEW_CAPTURE_MODE}">`,
+      )
     : injectTagsAtHeadStart(
         lazyPreviewImages(html),
         `<meta name="${STUDIO_PREVIEW_MARK_META}">${EARLY_ERRORS_SCRIPT}`,
       );
-  return injectStudioMotionScript(
-    injectMotionPathPluginIfNeeded(
-      injectGsapCdnFallback(
-        injectProjectSignature(marked, resolveProjectSignature(adapter, projectDir)),
+  const withFallback = injectGsapCdnFallback(
+    injectProjectSignature(
+      injectTagsAtHeadStart(
+        marked,
+        `<meta name="${GSAP_BASE_URL_META}" content="${escapeGsapUrl(options.gsapBaseUrl)}">`,
       ),
+      resolveProjectSignature(adapter, projectDir),
     ),
-    projectDir,
-    activeCompositionPath,
+    options.gsapBaseUrl,
   );
+  const studioMotion = readStudioMotion(projectDir, activeCompositionPath);
+  // Studio motion's GSAP core goes in first, so a MotionPathPlugin injected next lands after it.
+  const withMotionDependencies = studioMotion
+    ? injectStudioMotionDependencies(
+        withFallback,
+        studioMotion.manifestContent,
+        options.gsapBaseUrl,
+      )
+    : withFallback;
+  const withPlugin = injectMotionPathPluginIfNeeded(withMotionDependencies, options.gsapBaseUrl);
+  return studioMotion ? injectStudioMotionScript(withPlugin, studioMotion.script) : withPlugin;
 }
 
 async function transformPreviewHtml(
@@ -411,7 +445,24 @@ const withPreviewBase = (html: string, projectId: string) =>
     ? html
     : injectTagsAtHeadStart(html, `<base href="${previewBaseHref(projectId)}">`);
 
+function resolvePreviewGsapBaseUrl(adapter: PreviewApiAdapter): string {
+  const configured = process.env.HYPERFRAMES_GSAP_BASE_URL;
+  if (configured?.trim() || !adapter.gsapLocalRoot) {
+    try {
+      return normalizeGsapBaseUrl(configured);
+    } catch (cause) {
+      throw new Error(
+        "Invalid HYPERFRAMES_GSAP_BASE_URL: use an absolute HTTPS npm mirror root (plain HTTP only for localhost) without credentials, query, or fragment",
+        { cause },
+      );
+    }
+  }
+  return normalizeGsapLocalRoot(adapter.gsapLocalRoot);
+}
+
 export function registerPreviewRoutes(api: Hono, adapter: PreviewApiAdapter): void {
+  const gsapBaseUrl = resolvePreviewGsapBaseUrl(adapter);
+  const gsapEtagSalt = `:gsap:${createHash("sha1").update(gsapBaseUrl).digest("hex").slice(0, 12)}`;
   const previewCacheHeaders = (etag: string) => ({
     "Cache-Control": "private, no-cache",
     ETag: etag,
@@ -468,7 +519,7 @@ export function registerPreviewRoutes(api: Hono, adapter: PreviewApiAdapter): vo
         adapter,
         project.dir,
         mainCompositionPath,
-        capture,
+        { capture, gsapBaseUrl },
       );
       if (previewVariables) bundled = injectPreviewVariables(bundled, previewVariables);
       bundled = await injectMediaCodecMap(
@@ -498,7 +549,7 @@ export function registerPreviewRoutes(api: Hono, adapter: PreviewApiAdapter): vo
           adapter,
           project.dir,
           fallback.compositionPath,
-          capture,
+          { capture, gsapBaseUrl },
         );
         if (previewVariables) {
           fallbackAugmented = injectPreviewVariables(fallbackAugmented, previewVariables);
@@ -529,7 +580,7 @@ export function registerPreviewRoutes(api: Hono, adapter: PreviewApiAdapter): vo
     const previewVariables = vars.values;
     const capture = c.req.query(PREVIEW_CAPTURE_PARAM) !== undefined;
 
-    const etag = `"preview:${signature}${variablesEtagSalt(vars.raw)}${capture ? ":capture" : ""}"`;
+    const etag = `"preview:${signature}${gsapEtagSalt}${variablesEtagSalt(vars.raw)}${capture ? ":capture" : ""}"`;
     const ifNoneMatch = c.req.header("If-None-Match");
     if (ifNoneMatch === etag) {
       return new Response(null, {
@@ -591,7 +642,7 @@ export function registerPreviewRoutes(api: Hono, adapter: PreviewApiAdapter): vo
     // not revalidate to a 304 that skips the pin.
     const compPathHash = createHash("sha1").update(compPath).digest("hex");
     const capture = c.req.query(PREVIEW_CAPTURE_PARAM) !== undefined;
-    const etag = `"comp:v2:${compPathHash}:${signature}${variablesEtagSalt(vars.raw)}${capture ? ":capture" : ""}"`;
+    const etag = `"comp:v2:${compPathHash}:${signature}${gsapEtagSalt}${variablesEtagSalt(vars.raw)}${capture ? ":capture" : ""}"`;
     const ifNoneMatch = c.req.header("If-None-Match");
     if (ifNoneMatch === etag) {
       return new Response(null, {
@@ -610,11 +661,15 @@ export function registerPreviewRoutes(api: Hono, adapter: PreviewApiAdapter): vo
       adapter.runtimeUrl,
       baseHref,
       stamped,
+      gsapBaseUrl,
     );
     if (!html) return c.text("not found", 404);
     recordPreviewReferences(project.dir, html);
     html = ensureHfIds(await transformPreviewHtml(html, adapter, project, compPath));
-    html = injectStudioPreviewAugmentations(html, adapter, project.dir, compPath, capture);
+    html = injectStudioPreviewAugmentations(html, adapter, project.dir, compPath, {
+      capture,
+      gsapBaseUrl,
+    });
     if (previewVariables) html = injectPreviewVariables(html, previewVariables);
     html = await injectMediaCodecMap(html, adapter, project.dir, compPath, mediaCodecProbeCache);
     return c.html(html, 200, previewCacheHeaders(etag));
@@ -651,7 +706,12 @@ export function registerPreviewRoutes(api: Hono, adapter: PreviewApiAdapter): vo
     const proxyParam = c.req.query("hf-proxy");
     const boxParam = c.req.query(PREVIEW_PROXY_BOX_PARAM);
     const proxyBox = boxParam === undefined ? undefined : parsePreviewProxyBox(boxParam);
-    if (proxyBox === null || (proxyBox && proxyParam === undefined)) {
+    const lightRequested = c.req.query(PREVIEW_PROXY_LIGHT_PARAM) !== undefined;
+    if (
+      proxyBox === null ||
+      (proxyBox && proxyParam === undefined) ||
+      (lightRequested && !proxyBox)
+    ) {
       return c.text("not found", 404);
     }
     let proxyVariant: ProxyVariant | undefined;
@@ -664,7 +724,7 @@ export function registerPreviewRoutes(api: Hono, adapter: PreviewApiAdapter): vo
         return c.text("not found", 404);
       }
       const facts = await probeAssetCodec(file, undefined, mediaCodecProbeCache);
-      const eligibility = decideMediaProxyEligibility(facts);
+      const eligibility = decideMediaProxyEligibility(facts, lightRequested ? proxyBox : undefined);
       if (!eligibility.eligible) {
         return c.text(`media proxy unavailable: ${eligibility.reason}`, 422);
       }
@@ -697,12 +757,17 @@ export function registerPreviewRoutes(api: Hono, adapter: PreviewApiAdapter): vo
       try {
         // A cached copy settles before any timer; a transcode never holds one of
         // the browser's few connections to this host. 202 until the copy lands.
+        if (c.req.query(PREVIEW_PROXY_RETRY_PARAM) !== undefined) {
+          retryProxyCopy(project.dir, file, proxyVariant, proxyBox);
+        }
         servedPath = await waitForProxy(resolveProxy(project.dir, file, proxyVariant, proxyBox), 0);
       } catch (err) {
         if (err instanceof ProxyWaitTimeoutError) {
+          const progress = proxyCopyProgress(project.dir, file, proxyVariant, proxyBox);
           return c.text("media proxy is being made", 202, {
-            "Retry-After": String(PROXY_PENDING_RETRY_AFTER_SECONDS),
+            "Retry-After": progress === undefined ? String(PROXY_PENDING_RETRY_AFTER_SECONDS) : "1",
             "Cache-Control": "no-store",
+            ...(progress !== undefined && { [PREVIEW_PROXY_PROGRESS_HEADER]: progress.toFixed(3) }),
           });
         }
         if (err instanceof ProxyCapacityError) {
@@ -725,10 +790,13 @@ export function registerPreviewRoutes(api: Hono, adapter: PreviewApiAdapter): vo
     // file on each one. The full read also blocked the event loop, so every
     // other Studio request (SSE, saves, the voice track) waited behind it.
     const textBuffer = isText ? Buffer.from(readFileSync(file, "utf-8"), "utf-8") : null;
-    const totalSize = textBuffer ? textBuffer.length : statSync(servedPath).size;
+    const heldBuffer =
+      textBuffer ??
+      (contentType === "image/png" ? stripSdrPngColourTags(readFileSync(file)) : null);
+    const totalSize = heldBuffer ? heldBuffer.length : statSync(servedPath).size;
     const bodyFor = (start: number, end: number): BodyInit =>
-      textBuffer
-        ? new Uint8Array(textBuffer.subarray(start, end + 1))
+      heldBuffer
+        ? new Uint8Array(heldBuffer.subarray(start, end + 1))
         : // Node's web stream type and the DOM one do not overlap for tsc on
           // every platform's lib set; the double cast is the documented bridge.
           (Readable.toWeb(

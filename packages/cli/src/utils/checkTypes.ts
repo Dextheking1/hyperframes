@@ -1,11 +1,14 @@
 import type { CheckDeadline } from "./checkDeadline.js";
+import type { CheckProgress } from "./checkProgress.js";
 import type { ProjectLintResult } from "./lintProject.js";
 import type { LayoutIssue, LayoutOverflow, LayoutRect } from "./layoutAudit.js";
 import type { Canvas, MotionFrame } from "./motionAudit.js";
 import type { MotionSpec } from "./motionSpec.js";
 import type { ProjectDir } from "./project.js";
+import type { ProjectMedia } from "./projectMedia.js";
 import type { BrowserGpuMode } from "../browser/gpuPolicy.js";
 import type { HdrAutoPromotion } from "@hyperframes/engine";
+import type { ComponentReport } from "@hyperframes/inspector/live";
 import type { PrelaunchedBrowser } from "../capture/captureCompositionFrame.js";
 import type { CheckPhase } from "./checkDeadline.js";
 
@@ -21,8 +24,11 @@ export interface CheckOptions {
   tolerance: number;
   timeout: number;
   contrast: boolean;
+  skipContrastInMotion?: boolean;
   strict: boolean;
   snapshots: boolean;
+  findingFrames?: boolean;
+  inspect?: boolean;
   captionZone?: CaptionZoneOptions;
   frameCheck?: FrameCheckOptions;
   /** Opt-in layout-audit knobs (`--layout "proseCoverageFloor=0.05"`). Defaults stay in the browser audit. */
@@ -76,7 +82,15 @@ export interface CheckAnchor {
   time: number;
   times?: number[];
   componentMatch?: boolean;
+  frame?: string;
+  frameTime?: number;
+  inspect?: CheckFindingInspect;
 }
+
+/** The inspector's own report for the finding's element at `frameTime`, or why it could not run. */
+export type CheckFindingInspect = ComponentReport | { error: string };
+
+export type CheckInspectTarget = { hfId: string } | { selector: string };
 
 export interface CheckFinding extends CheckAnchor {
   timeRange?: [number, number];
@@ -134,6 +148,23 @@ export interface CheckFindingCropRequest {
   filename: string;
   time: number;
   bbox: CheckBbox;
+}
+
+export interface CheckFindingFrameRequest {
+  time: number;
+  filename: string;
+  inspect?: CheckInspectTarget[];
+}
+
+export interface CheckFindingFrames {
+  written: string[];
+  inspected: CheckFindingInspection[];
+}
+
+export interface CheckFindingInspection {
+  time: number;
+  target: CheckInspectTarget;
+  inspect: CheckFindingInspect;
 }
 
 export interface CheckGeometryCandidate extends CheckAnchor {
@@ -266,6 +297,7 @@ export interface CheckAuditDriver {
   collectContrast(
     time: number,
     snapshotAnnotations?: CheckAnnotationBox[],
+    skipInMotion?: boolean,
   ): Promise<ContrastCapture>;
   /** Craft section: text, stillness and paint at the current seek. A driver without it skips the section. */
   collectCraftFrame?(time: number): Promise<CraftFrame>;
@@ -327,6 +359,8 @@ export type RunAuditGrid = (
   motion: MotionSpecResolution,
   helpers?: Promise<CheckAuditDriver[]>,
   enter?: (phase: CheckPhase) => void,
+  report?: CheckProgress,
+  keep?: (read: () => Partial<CheckBrowserResult>) => void,
 ) => Promise<CheckBrowserResult>;
 
 export interface CheckSection<T extends CheckFinding = CheckFinding> {
@@ -366,6 +400,7 @@ export interface CheckReport {
     passed: number;
   };
   craft: CheckSection<CraftFinding> & { enabled: boolean; step: number; samples: number };
+  audio: CheckSection;
   hdr: { autoPromotion: HdrAutoPromotion | null; inspection: "available" | "unavailable" };
   snapshots: { enabled: boolean; files: string[]; times: number[]; findingFiles: string[] };
 }
@@ -396,7 +431,18 @@ export interface CheckDependencies {
     requests: CheckFindingCropRequest[],
     deadline?: CheckDeadline,
   ): Promise<string[]>;
-  inspectHdrAutoPromotion?(project: ProjectDir): Promise<CheckReport["hdr"]["autoPromotion"]>;
+  captureFindingFrames?(
+    project: ProjectDir,
+    options: CheckOptions,
+    requests: CheckFindingFrameRequest[],
+    deadline?: CheckDeadline,
+  ): Promise<CheckFindingFrames>;
+  collectMedia?(project: ProjectDir): Promise<ProjectMedia>;
+  inspectHdrAutoPromotion?(
+    project: ProjectDir,
+    media: ProjectMedia,
+  ): Promise<CheckReport["hdr"]["autoPromotion"]>;
+  inspectAudio?(project: ProjectDir, media: ProjectMedia): Promise<CheckFinding[]>;
 }
 
 export function rectToBbox(rect: {

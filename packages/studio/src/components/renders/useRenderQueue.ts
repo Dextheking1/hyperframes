@@ -1,4 +1,3 @@
-import { htmlInCanvasForm } from "@hyperframes/core/html-in-canvas";
 import { buildProjectApiPath } from "../../utils/projectRouting";
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import type { CanvasResolution } from "@hyperframes/parsers";
@@ -10,11 +9,6 @@ import { readServerError } from "./serverError";
 import { ffmpegInstallMessage, useFfmpegStatus } from "./useFfmpegStatus";
 import { requestStudioFeedback, type FeedbackContext } from "../feedback/feedbackTrigger";
 import { studioApiFetch } from "../../utils/studioApiFetch";
-
-// WYSIWYG: the preview iframe runs in this browser, so a render blurs only if this one can.
-function canPreviewMotionBlur(): boolean {
-  return typeof document !== "undefined" && htmlInCanvasForm() !== null;
-}
 
 export interface RenderJob {
   id: string;
@@ -35,10 +29,11 @@ export type ResolutionPreset = CanvasResolution;
 export interface StartRenderOptions {
   fps?: number;
   quality?: "draft" | "standard" | "high";
-  format?: "mp4" | "webm" | "mov";
+  format?: "mp4" | "webm" | "mov" | "gif";
   /** `"auto"` (default) renders at the composition's authored dimensions. */
   resolution?: ResolutionPreset | "auto";
   gpu?: boolean;
+  gifLoop?: number;
   /**
    * Render a specific composition file. Omit it to render the composition the
    * user currently has open — only the sidebar's per-composition Render button
@@ -242,14 +237,13 @@ export function useRenderQueue(
         composition?: string;
         variables?: Record<string, unknown>;
         gpu?: boolean;
+        gifLoop?: number;
         telemetryDistinctId?: string;
         telemetryOptOut?: boolean;
-        previewMotionBlur: boolean;
       } = {
         fps,
         quality,
         format,
-        previewMotionBlur: canPreviewMotionBlur(),
       };
       // The id is MINTED by getAnonymousId(), so calling it unconditionally
       // created a telemetry identity for a profile that had opted out — and
@@ -269,6 +263,7 @@ export function useRenderQueue(
       if (resolution && resolution !== "auto") body.resolution = resolution;
       if (composition) body.composition = composition;
       if (opts.gpu) body.gpu = true;
+      if (format === "gif" && opts.gifLoop !== undefined) body.gifLoop = opts.gifLoop;
       if (opts.variables && Object.keys(opts.variables).length > 0) {
         body.variables = opts.variables;
       }
@@ -312,7 +307,12 @@ export function useRenderQueue(
       }
       const { jobId } = await res.json();
 
-      const FORMAT_EXT: Record<string, string> = { mp4: ".mp4", webm: ".webm", mov: ".mov" };
+      const FORMAT_EXT: Record<string, string> = {
+        mp4: ".mp4",
+        webm: ".webm",
+        mov: ".mov",
+        gif: ".gif",
+      };
       const ext = FORMAT_EXT[format] ?? ".mp4";
       const job: RenderJob = {
         id: jobId,

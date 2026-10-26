@@ -19,11 +19,12 @@ export type PageMotionBlurOff = "off" | "hdr-render" | "layered-composite" | "di
 export type SubTimelineWaitOutcome = "ready" | "timeout" | "script_failure";
 
 /**
- * Shared by every capture session of one render: composition ids whose timeline
- * wait already timed out, so later sessions report the timeout without waiting again.
+ * Shared by every capture session of one render: timeline waits that already timed out
+ * (so later sessions skip the wait), and scene callback errors the render log already shows.
  */
 export interface SubTimelineWaitMemo {
   unregisteredIds?: readonly string[];
+  loggedSceneCallbackErrors?: string[];
 }
 
 export type CaptureWarningCode =
@@ -32,6 +33,7 @@ export type CaptureWarningCode =
   | "audio_processing_failed"
   | "sub_timeline_readiness_timeout"
   | "sub_timeline_script_failure"
+  | "script_error_isolated"
   | "vfx_failure"
   | "live_map_detected";
 
@@ -43,6 +45,7 @@ export interface CaptureWarning {
     mediaType?: "image" | "video" | "audio";
     sources?: string[];
     pendingCompositionIds?: string[];
+    isolatedElements?: Array<{ compositionId: string; elementId: string | null }>;
     timeoutMs?: number;
     audioFailures?: AudioFailureDiagnostic[];
     failureReasons?: string[];
@@ -166,6 +169,7 @@ export interface CaptureOptions {
    */
   fps: Fps;
   format?: "jpeg" | "png";
+  transparent?: boolean;
   quality?: number;
   /**
    * Opt into sub-frame multi-sample motion blur (issue #4010). Absent means off and the
@@ -238,6 +242,7 @@ export interface CaptureOptions {
    * Clamped to 0..8 like the env knob; HF_DE_VERIFY, when set, still wins.
    */
   deVerifySamples?: number;
+  deFrameFallback?: boolean;
 }
 
 export interface CaptureVideoMetadataHint {
@@ -414,6 +419,7 @@ export interface CapturePerfSummary {
   deVerifyInitMs: number;
   /** Clip-cut boundary frames routed to per-frame screenshot (Lim 6). */
   deBoundaryFrames: number;
+  deRiskFrames: number;
   /** Per-frame "No cached paint record" screenshot fallbacks during capture. */
   deNcprFallbacks: number;
   /**

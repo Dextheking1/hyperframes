@@ -14,16 +14,33 @@ const snapshotState = vi.hoisted(() => ({
   seek: vi.fn(async (_page: unknown, _time: number, _options?: unknown): Promise<void> => {
     throw new Error("seek reached");
   }),
-  settle: vi.fn(async (_page: unknown, _options?: unknown): Promise<void> => undefined),
+  settle: vi.fn(async (_page: unknown, _options?: unknown) => ({ pending: [], failed: [] })),
   closeServer: vi.fn(async () => undefined),
+  ffmpegTimesOut: false,
+  noFfmpeg: false,
 }));
 
-vi.mock("../capture/captureCompositionFrame.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../capture/captureCompositionFrame.js")>()),
-  openSettledCompositionPage: snapshotState.openSettledPage,
-  seekCompositionTimelineOnly: snapshotState.seek,
-  settleCompositionSeek: snapshotState.settle,
-}));
+vi.mock("../browser/ffmpeg.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../browser/ffmpeg.js")>();
+  return {
+    ...actual,
+    findFFmpeg: () => (snapshotState.noFfmpeg ? undefined : actual.findFFmpeg()),
+  };
+});
+
+vi.mock("../capture/captureCompositionFrame.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../capture/captureCompositionFrame.js")>();
+  return {
+    ...actual,
+    openSettledCompositionPage: snapshotState.openSettledPage,
+    seekCompositionTimelineOnly: snapshotState.seek,
+    settleCompositionSeek: snapshotState.settle,
+    runFfmpegOnce: (...args: Parameters<typeof actual.runFfmpegOnce>) =>
+      snapshotState.ffmpegTimesOut
+        ? Promise.resolve({ code: null, timedOut: true, stderr: "" })
+        : actual.runFfmpegOnce(...args),
+  };
+});
 
 vi.mock("../utils/staticProjectServer.js", () => ({
   serveStaticProjectHtml: vi.fn(async () => ({
@@ -34,11 +51,14 @@ vi.mock("../utils/staticProjectServer.js", () => ({
 
 import snapshotCommand, {
   extractVideoFrameToBuffer,
+  extractVideoFrameOrWarn,
+  probeContainingSourceFrameSeek,
   containingSourceFrameIndex,
   computeSnapshotTimes,
   formatSnapshotTimestamp,
   parseZoomScale,
   recaptureSnapshotComposite,
+  renderNotReadyError,
   requireSnapshotFfmpeg,
   resolveSnapshotVideoClipStart,
   resolveSnapshotVideoFrameTime,
@@ -183,9 +203,11 @@ describe("snapshot --at seeks", () => {
           args: { dir: project, at: "19.019018", end: false, output: join(project, "out") },
         } as never),
       ).rejects.toBeDefined();
-      expect(snapshotState.seek).toHaveBeenCalledWith(expect.anything(), 19.019018, {
-        exactTime: true,
-      });
+      expect(snapshotState.seek).toHaveBeenCalledWith(
+        expect.anything(),
+        19.019018,
+        expect.objectContaining({ exactTime: true }),
+      );
       expect(close).toHaveBeenCalled();
     } finally {
       log.mockRestore();
@@ -228,6 +250,7 @@ describe("snapshot video overlays and the blurred frame", () => {
     snapshotState.settle.mockClear();
     snapshotState.settle.mockImplementation(async () => {
       log.push("settle");
+      return { pending: [], failed: [] };
     });
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
 
@@ -423,10 +446,27 @@ describe("containingSourceFrameIndex", () => {
   });
 });
 
+/** The pixel data of a PNG: the colour-tag chunks a retag adds are not part of the picture. */
+function samePixels(actual: Buffer | null | undefined, expected: Buffer): boolean {
+  const idat = (png: Buffer): Buffer => {
+    const chunks: Buffer[] = [];
+    for (let at = 8; at < png.length; at += 12 + png.readUInt32BE(at)) {
+      if (png.toString("latin1", at + 4, at + 8) === "IDAT") {
+        chunks.push(png.subarray(at + 8, at + 8 + png.readUInt32BE(at)));
+      }
+    }
+    return Buffer.concat(chunks);
+  };
+  return !!actual && idat(actual).equals(idat(expected));
+}
+
 describe("extractVideoFrameToBuffer", () => {
   const ffmpeg = findFFmpeg();
   const ffprobe = findFFprobe();
   const noProbe = !ffmpeg || !ffprobe;
+  const hasX265 =
+    !noProbe &&
+    execFileSync(ffmpeg!, ["-hide_banner", "-encoders"], { encoding: "utf-8" }).includes("libx265");
 
   it.skipIf(noProbe)("selects containing frames for snapshots and reference pairs", async () => {
     const dir = mkdtempSync(join(tmpdir(), "hf-snapshot-containing-"));
@@ -465,7 +505,7 @@ describe("extractVideoFrameToBuffer", () => {
           expected,
         ]);
         const actual = await extractVideoFrameToBuffer(clip, time);
-        expect(actual?.equals(readFileSync(expected))).toBe(true);
+        expect(samePixels(actual, readFileSync(expected))).toBe(true);
       }
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -506,11 +546,22 @@ describe("extractVideoFrameToBuffer", () => {
         "-y",
         expected,
       ]);
-      expect((await extractVideoFrameToBuffer(clip, 0.3))?.equals(readFileSync(expected))).toBe(
+      expect(samePixels(await extractVideoFrameToBuffer(clip, 0.3), readFileSync(expected))).toBe(
         true,
       );
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("still stops with the install hint when FFmpeg is missing, instead of blanking every clip", async () => {
+    snapshotState.noFfmpeg = true;
+    try {
+      await expect(extractVideoFrameOrWarn([], "clip.mp4", 0.5)).rejects.toThrow(
+        /FFmpeg is required to extract video frames for snapshots/,
+      );
+    } finally {
+      snapshotState.noFfmpeg = false;
     }
   });
 
@@ -539,12 +590,164 @@ describe("extractVideoFrameToBuffer", () => {
           ...["-i", clip, "-vf", `select=eq(n\\,${index})`, "-frames:v", "1", "-y", expected],
         ]);
         const actual = await extractVideoFrameToBuffer(clip, (index + 0.5) / 30);
-        expect(actual?.equals(readFileSync(expected)), `frame ${index}`).toBe(true);
+        expect(samePixels(actual, readFileSync(expected)), `frame ${index}`).toBe(true);
       }
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it.skipIf(noProbe || !hasX265)(
+    "seeks into a stream-copied HEVC cut instead of decoding it from the start",
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), "hf-snapshot-hevc-cut-"));
+      try {
+        const quiet = ["-hide_banner", "-loglevel", "error"];
+        const source = join(dir, "source.mov");
+        const x265 = "bframes=3:keyint=250:min-keyint=250:open-gop=0:scenecut=0:log-level=error";
+        execFileSync(ffmpeg!, [
+          ...quiet,
+          ...["-f", "lavfi", "-i", "testsrc2=d=70:r=30:s=160x90", "-pix_fmt", "yuv420p"],
+          ...[
+            "-c:v",
+            "libx265",
+            "-preset",
+            "ultrafast",
+            "-x265-params",
+            x265,
+            "-tag:v",
+            "hvc1",
+            source,
+          ],
+        ]);
+        const clip = join(dir, "cut.mov");
+        execFileSync(ffmpeg!, [...quiet, ...["-ss", "31.77", "-i", source, "-c", "copy", clip]]);
+
+        const seek = await probeContainingSourceFrameSeek(clip, 35.2, false);
+        expect(seek?.seek, "must seek, not decode from the start").toBeDefined();
+
+        const expected = join(dir, "frame.png");
+        execFileSync(ffmpeg!, [
+          ...quiet,
+          ...["-i", clip, "-vf", "select=eq(n\\,1056)", "-frames:v", "1", "-y", expected],
+        ]);
+        const actual = await extractVideoFrameToBuffer(clip, 1056.5 / 30);
+        expect(samePixels(actual, readFileSync(expected))).toBe(true);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(noProbe)("names the clip and time when FFmpeg times out", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hf-snapshot-timeout-"));
+    try {
+      const clip = join(dir, "clip.mp4");
+      execFileSync(ffmpeg!, [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=d=1:r=24:s=160x90",
+        "-pix_fmt",
+        "yuv420p",
+        clip,
+      ]);
+      snapshotState.ffmpegTimesOut = true;
+      await expect(extractVideoFrameToBuffer(clip, 0.5)).rejects.toThrow(/clip\.mp4 at 0\.50s/);
+    } finally {
+      snapshotState.ffmpegTimesOut = false;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(noProbe)(
+    "keeps the snapshot going and records the clip when FFmpeg times out",
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), "hf-snapshot-finding-"));
+      try {
+        const clip = join(dir, "clip.mp4");
+        execFileSync(ffmpeg!, [
+          "-hide_banner",
+          "-loglevel",
+          "error",
+          "-f",
+          "lavfi",
+          "-i",
+          "testsrc=d=1:r=24:s=160x90",
+          "-pix_fmt",
+          "yuv420p",
+          clip,
+        ]);
+        snapshotState.ffmpegTimesOut = true;
+        const warnings: string[] = [];
+        expect(await extractVideoFrameOrWarn(warnings, clip, 0.5)).toBeNull();
+        expect(warnings).toHaveLength(1);
+        expect(warnings[0]).toMatch(/clip\.mp4 at 0\.50s/);
+      } finally {
+        snapshotState.ffmpegTimesOut = false;
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(noProbe).each([
+    [24, 10.02],
+    [60, 10.02],
+    [60, 11.3],
+    [12, 10.02],
+    [12.04, 10.02],
+  ])(
+    "decodes from near the target at %s fps, %ss, when no keyframe seek is usable",
+    async (fps, time) => {
+      const dir = mkdtempSync(join(tmpdir(), "hf-snapshot-onegop-"));
+      try {
+        const clip = join(dir, "clip.mp4");
+        execFileSync(ffmpeg!, [
+          "-hide_banner",
+          "-loglevel",
+          "error",
+          "-f",
+          "lavfi",
+          "-i",
+          `testsrc=d=13:r=${fps}:s=160x90`,
+          "-pix_fmt",
+          "yuv420p",
+          "-g",
+          "10000",
+          "-sc_threshold",
+          "0",
+          clip,
+        ]);
+        const seek = await probeContainingSourceFrameSeek(clip, time, false);
+        expect(seek?.seek).toBeGreaterThan(4);
+        const index = Math.floor(time * fps + 1e-6);
+        const expected = join(dir, "expected.png");
+        execFileSync(ffmpeg!, [
+          "-hide_banner",
+          "-loglevel",
+          "error",
+          "-i",
+          clip,
+          "-vf",
+          `select=eq(n\\,${index})`,
+          "-frames:v",
+          "1",
+          "-q:v",
+          "2",
+          "-y",
+          expected,
+        ]);
+        expect(
+          samePixels(await extractVideoFrameToBuffer(clip, time), readFileSync(expected)),
+        ).toBe(true);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
 
   it.skipIf(noProbe)(
     "leaves an unreadable video blank instead of failing the snapshot",
@@ -581,7 +784,7 @@ describe("extractVideoFrameToBuffer", () => {
             ...["-i", clip, "-vf", `select=eq(n\\,${index})`, "-frames:v", "1", "-y", expected],
           ]);
           const actual = await extractVideoFrameToBuffer(clip, index / 24);
-          expect(actual?.equals(readFileSync(expected)), `frame ${index}`).toBe(true);
+          expect(samePixels(actual, readFileSync(expected)), `frame ${index}`).toBe(true);
         }
       } finally {
         rmSync(dir, { recursive: true, force: true });
@@ -611,7 +814,7 @@ describe("extractVideoFrameToBuffer", () => {
             ...["-i", clip, "-vf", `select=eq(n\\,${index})`, "-frames:v", "1", "-y", expected],
           ]);
           const actual = await extractVideoFrameToBuffer(clip, index / 24);
-          expect(actual?.equals(readFileSync(expected)), `frame ${index}`).toBe(true);
+          expect(samePixels(actual, readFileSync(expected)), `frame ${index}`).toBe(true);
         }
       } finally {
         rmSync(dir, { recursive: true, force: true });
@@ -664,7 +867,7 @@ describe("extractVideoFrameToBuffer", () => {
           ...["-frames:v", "1", "-y", expected],
         ]);
         const actual = await extractVideoFrameToBuffer(clip, time);
-        expect(actual?.equals(readFileSync(expected)), `t=${time}`).toBe(true);
+        expect(samePixels(actual, readFileSync(expected)), `t=${time}`).toBe(true);
       }
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -672,6 +875,7 @@ describe("extractVideoFrameToBuffer", () => {
   });
 
   it.skipIf(noProbe)("selects frames in a TS whose timestamps start below zero", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const dir = mkdtempSync(join(tmpdir(), "hf-snapshot-negative-"));
     try {
       const clip = join(dir, "clip.ts");
@@ -696,7 +900,7 @@ describe("extractVideoFrameToBuffer", () => {
           ...["-i", clip, "-vf", `select=eq(n\\,${index})`, "-frames:v", "1", "-y", expected],
         ]);
         const actual = await extractVideoFrameToBuffer(clip, time);
-        expect(actual?.equals(readFileSync(expected)), `t=${time}`).toBe(true);
+        expect(samePixels(actual, readFileSync(expected)), `t=${time}`).toBe(true);
       };
       for (const [time, index] of [
         [0, 0],
@@ -715,7 +919,10 @@ describe("extractVideoFrameToBuffer", () => {
         [1, 30],
       ] as const)
         await frameAt(time, index);
+      // Colours cannot be matched to render without ffprobe: said once, not per frame.
+      expect(warn.mock.calls.filter(([m]) => /colours may differ/.test(String(m)))).toHaveLength(1);
     } finally {
+      warn.mockRestore();
       vi.unstubAllEnvs();
       rmSync(dir, { recursive: true, force: true });
     }
@@ -745,8 +952,23 @@ describe("extractVideoFrameToBuffer", () => {
           ...["-i", clip, "-vf", `select=eq(n\\,${index})`, "-frames:v", "1", "-y", expected],
         ]);
         const actual = await extractVideoFrameToBuffer(clip, time);
-        expect(actual?.equals(readFileSync(expected)), `t=${time}`).toBe(true);
+        expect(samePixels(actual, readFileSync(expected)), `t=${time}`).toBe(true);
       }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(noProbe)("retags SDR footage as sRGB, as render does", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hf-snapshot-retag-"));
+    try {
+      const clip = join(dir, "clip.mp4");
+      execFileSync(ffmpeg!, [
+        ...["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=d=1:r=24:s=160x90"],
+        ...["-pix_fmt", "yuv420p", "-colorspace", "bt709", "-color_trc", "bt709", clip],
+      ]);
+      const png = await extractVideoFrameToBuffer(clip, 0.5);
+      expect(png?.includes("sRGB", 0, "latin1")).toBe(true);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -766,7 +988,7 @@ describe("extractVideoFrameToBuffer", () => {
         ...["-hide_banner", "-loglevel", "error", "-i", clip, "-vf", "select=eq(n\\,12)"],
         ...["-frames:v", "1", "-y", expected],
       ]);
-      expect((await extractVideoFrameToBuffer(clip, 0.5))?.equals(readFileSync(expected))).toBe(
+      expect(samePixels(await extractVideoFrameToBuffer(clip, 0.5), readFileSync(expected))).toBe(
         true,
       );
     } finally {
@@ -1079,4 +1301,35 @@ it("addresses colliding scene videos by the capture page's render identity", asy
     vi.unstubAllGlobals();
     rmSync(project, { recursive: true, force: true });
   }
+});
+
+describe("renderNotReadyError", () => {
+  it("names the buildReady keys still pending and the time waited", async () => {
+    const page = {
+      evaluate: async () => ({
+        renderReady: false,
+        hasHf: true,
+        hasSeek: false,
+        hasPlayer: true,
+        duration: -1,
+        hasTimeline: true,
+        declaredDuration: 12,
+        pendingBuildReadyKeys: ["gltf"],
+        rejectedBuildReadyKeys: [],
+      }),
+    };
+    const error = await renderNotReadyError(page as never, 45_000);
+    expect(error.message).toContain("not render-ready after 45000ms");
+    expect(error.message).toContain("buildReady never resolved for: gltf");
+  });
+
+  it("still fails when the page cannot be asked why", async () => {
+    const page = {
+      evaluate: async () => {
+        throw new Error("Target closed");
+      },
+    };
+    const error = await renderNotReadyError(page as never, 5000);
+    expect(error.message).toContain("not render-ready after 5000ms");
+  });
 });
