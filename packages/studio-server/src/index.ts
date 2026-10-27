@@ -1,4 +1,8 @@
 export { createStudioApi, type StudioApiOptions } from "./createStudioApi.js";
+export {
+  PREVIEW_ALLOWED_HOSTS_ENV,
+  previewAllowedHostsFromEnv,
+} from "./helpers/requestIdentity.js";
 export { MAX_UPLOAD_BYTES } from "./routes/files.js";
 export {
   createProjectSignature,

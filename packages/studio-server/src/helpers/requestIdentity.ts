@@ -49,6 +49,30 @@ function hostMatchesBind(host: string | undefined, bind: string): boolean {
     : false;
 }
 
+// Extra hosts whose writes the studio API accepts, comma separated. The CLI
+// preview server and the Studio dev server read it and pass the names to
+// createStudioApi as allowedHosts, so a Codespaces or tunnel user allows
+// their public host name in one step. A refused write names this variable.
+export const PREVIEW_ALLOWED_HOSTS_ENV = "HYPERFRAMES_PREVIEW_ALLOWED_HOSTS";
+
+export function previewAllowedHostsFromEnv(
+  env: { [key: string]: string | undefined } = process.env,
+): string[] {
+  return (env[PREVIEW_ALLOWED_HOSTS_ENV] ?? "")
+    .split(",")
+    .map((host) => host.trim())
+    .filter((host) => host !== "");
+}
+
+// The host a request is addressed to, for checks and for refusal messages:
+// the first forwarded host wins, since that is the name the browser used.
+export function requestHost(headers: {
+  host?: string;
+  forwardedHost?: string;
+}): string | undefined {
+  return firstForwarded(headers.forwardedHost) ?? headers.host;
+}
+
 // A loopback Host always passes. Any other Host passes only when the bind (HYPERFRAMES_PREVIEW_HOST) names it, or is a wildcard and the Host is a local name.
 export function identityAllowed(host: string | undefined): boolean {
   if (isLoopbackHost(host)) return true;

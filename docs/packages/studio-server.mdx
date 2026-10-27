@@ -61,6 +61,15 @@ app.route(
 );
 ```
 
+With `hyperframes preview` and the Studio dev server there is no code to
+change: both read the extra hosts from `HYPERFRAMES_PREVIEW_ALLOWED_HOSTS`
+(comma separated) and pass them as `allowedHosts`. A refused write answers
+403 with the refused host named and this variable as the fix:
+
+```bash
+HYPERFRAMES_PREVIEW_ALLOWED_HOSTS=demo.tunnels.example hyperframes preview
+```
+
 A `StudioApiAdapter` supplies:
 
 - project listing and resolution;

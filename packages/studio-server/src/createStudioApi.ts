@@ -19,7 +19,11 @@ import { registerGlobalAssetRoutes } from "./routes/globalAssets.js";
 import { registerHistoryRoutes } from "./routes/history.js";
 import { replaceWithProjectDirMissing } from "./helpers/projectDirMissing.js";
 import { folderGone, isProjectRootMissing } from "./helpers/safePath.js";
-import { sameOriginPost } from "./helpers/requestIdentity.js";
+import {
+  PREVIEW_ALLOWED_HOSTS_ENV,
+  requestHost,
+  sameOriginPost,
+} from "./helpers/requestIdentity.js";
 import { previewErrorPage } from "./helpers/previewErrorPage.js";
 
 async function answerRefusedFrameWithPage(c: Context, next: Next) {
@@ -75,7 +79,25 @@ export function createStudioApi(adapter: StudioApiAdapter, options: StudioApiOpt
       forwardedHost: c.req.header("x-forwarded-host"),
       allowedHosts: options.allowedHosts,
     });
-    if (!allowed) return c.json({ error: "forbidden" }, 403);
+    if (!allowed) {
+      // Name the refused host and the variable that allows it, so a user
+      // behind a proxy or tunnel can fix the 403 in one step instead of
+      // silently losing every save.
+      const refusedHost =
+        requestHost({
+          host: c.req.header("host") ?? urlHost(c.req.url),
+          forwardedHost: c.req.header("x-forwarded-host"),
+        }) ?? "unknown host";
+      return c.json(
+        {
+          error:
+            `forbidden: writes from host "${refusedHost}" are not allowed. ` +
+            `Set ${PREVIEW_ALLOWED_HOSTS_ENV}=${refusedHost} to allow it ` +
+            `(comma separated for several hosts).`,
+        },
+        403,
+      );
+    }
     return next();
   });
   api.use("/projects/:id/preview/*", answerRefusedFrameWithPage);

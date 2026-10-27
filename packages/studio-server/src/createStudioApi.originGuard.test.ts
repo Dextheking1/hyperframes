@@ -9,6 +9,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createStudioApi } from "./createStudioApi";
+import { previewAllowedHostsFromEnv } from "./helpers/requestIdentity";
 import { stubAdapter } from "./routes/stubAdapter.test-helpers";
 
 const tempDirs: string[] = [];
@@ -227,6 +228,36 @@ describe("createStudioApi cross-origin write guard", () => {
     expect(existsSync(join(projectDir, "planted.html"))).toBe(false);
   });
 
+  it("names the refused host and the allowing env var in a refused write", async () => {
+    const { app, projectDir } = createApp();
+    const res = await createFile(app, {
+      Host: "rebind.example:9999",
+      Origin: "http://rebind.example:9999",
+      "Sec-Fetch-Site": "same-origin",
+      "Content-Type": "text/plain",
+    });
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toContain("rebind.example:9999");
+    expect(body.error).toContain("HYPERFRAMES_PREVIEW_ALLOWED_HOSTS");
+    expect(existsSync(join(projectDir, "planted.html"))).toBe(false);
+  });
+
+  it("rejects a forged X-Forwarded-Host whose Origin does not match it", async () => {
+    // The Host check alone would pass: the forwarded host names loopback.
+    // The Origin comparison is what stops it, since the page's real origin
+    // is the rebinding name, not the forwarded one.
+    const { app, projectDir } = createApp();
+    const res = await createFile(app, {
+      Host: "rebind.example:9999",
+      Origin: "http://rebind.example:9999",
+      "X-Forwarded-Host": "localhost",
+      "Content-Type": "text/plain",
+    });
+    expect(res.status).toBe(403);
+    expect(existsSync(join(projectDir, "planted.html"))).toBe(false);
+  });
+
   it("allows a write through a tunnel that rewrites Host and forwards its own", async () => {
     const projectDir = mkdtempSync(join(tmpdir(), "hf-origin-guard-"));
     tempDirs.push(projectDir);
@@ -246,5 +277,20 @@ describe("createStudioApi cross-origin write guard", () => {
     });
     expect(res.status).toBe(201);
     expect(existsSync(join(projectDir, "planted.html"))).toBe(true);
+  });
+});
+
+describe("previewAllowedHostsFromEnv", () => {
+  it("parses a comma separated list, trimming blanks", () => {
+    expect(
+      previewAllowedHostsFromEnv({
+        HYPERFRAMES_PREVIEW_ALLOWED_HOSTS: " demo.tunnels.example ,, studio.example.com ",
+      }),
+    ).toEqual(["demo.tunnels.example", "studio.example.com"]);
+  });
+
+  it("is empty when the variable is unset or blank", () => {
+    expect(previewAllowedHostsFromEnv({})).toEqual([]);
+    expect(previewAllowedHostsFromEnv({ HYPERFRAMES_PREVIEW_ALLOWED_HOSTS: "  " })).toEqual([]);
   });
 });
